@@ -1,0 +1,46 @@
+# ---- 凭据：绝不入库 ----
+*.env
+.env.*
+credentials*.yaml
+credentials*.yml
+douyin-cookies.txt
+.douyin-cookies*
+*_rsa
+*_miyao
+rsa_*
+*.pem
+*.key
+!*.key.example
+
+# ---- 运行产物 ----
+# Skill 运行时会写的时间日志（含视频 ID 与耗时）
+douyin-timing.log
+*.log
+# 下载/转码中间产物
+dy_*.html
+dy_*.mp4
+dy_*.wav
+dy_*.m4a
+dy_part*.wav
+dy_txt_*.txt
+dy_img_*
+dy_transcript.txt
+
+# ---- 评测运行产物（含完整 agent 会话轨迹与本地绝对路径）----
+evals/.skill-up-workspace/
+**/.skill-up-workspace/
+.skill-up-dsh/
+result.json
+grading.json
+eval_metadata.json
+
+# ---- 系统/编辑器 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+__pycache__/
+*.py[cod]
+.venv/
+venv/
