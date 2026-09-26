@@ -1,0 +1,38 @@
+id: triage-video-share-page
+title: 分享页解析契约 —— 视频分支 triage 必须取出 desc/ID 并给出无水印直链
+description: 验证 Skill 的 triage 规则：解析 _ROUTER_DATA、识别 video 分支、把 playwm 替换为 play
+
+input:
+  prompt: |
+    工作区里有一份抖音分享页 HTML：share.html。
+
+    严格按 douyin-to-text 这个 Skill 的「步骤 1：Triage + 取直链」做一次
+    不联网、不下载的纯解析，然后输出且仅输出下面四行（值取自文件内容本身）：
+
+    DESC=<desc 原文>
+    KIND=<video 或 note>
+    ID=<数字 ID>
+    PLAY=<无水印直链>
+
+    注意：直链要按 Skill 里的规则处理，不要照抄页面里的原始播放地址。
+    不要下载视频，不要调用任何网络请求。
+
+context:
+  repo_fixture: evals/fixtures/repos/triage-video
+
+expect:
+  must_contain:
+    - 这是一条用于测试的示例文案 #测试标签 #离线夹具
+    - "1111111111111111111"
+    - example.invalid/play/?video_id=vFAKE0000000000000000000000000
+    - KIND=video
+
+judge:
+  type: rule_based
+  success:
+    - output_contains:
+        all:
+          - DESC=
+          - KIND=video
+          - ID=1111111111111111111
+          - example.invalid/play/?video_id=vFAKE0000000000000000000000000

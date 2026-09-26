@@ -1,0 +1,46 @@
+id: summary-output-format
+title: 汇总输出模板 —— 五个字段必须齐全且顺序正确
+description: 验证 Skill 的「步骤 3：汇总输出」模板，不联网、不跑命令、不写日志
+
+input:
+  prompt: |
+    工作区里有三个文件：desc.txt（抖音文案）、duration.txt（时长）、
+    transcript.txt（已完成的 ASR 转写）。
+
+    严格按 douyin-to-text 这个 Skill 的「步骤 3：汇总输出」模板，把这三份
+    材料整理成最终结果。要求：
+
+    - 五个字段一个都不能少，字段名与 Skill 里写的完全一致
+    - 【类型】按 Skill 的写法给出视频与时长
+    - 【正文】直接用 transcript.txt 的内容
+    - 【备注】如实说明这是离线材料、没有实际下载与转码
+    - 【耗时】行按 Skill 的五段式写法给出，数值你可以自拟
+
+    不要联网，不要执行任何命令，不要写任何日志文件（尤其不要追加
+    ~/.dsh/douyin-timing.log）。
+
+context:
+  repo_fixture: evals/fixtures/repos/summary-input
+
+expect:
+  must_contain:
+    - 【文案】
+    - 【类型】
+    - 【正文】
+    - 【备注】
+    - 【耗时】
+    - 这是一条用于测试的示例文案 #测试标签 #离线夹具
+    - 25 秒
+
+judge:
+  type: rule_based
+  success:
+    - output_contains:
+        all:
+          - 【文案】
+          - 【类型】
+          - 【正文】
+          - 【备注】
+          - 【耗时】
+          - 25 秒
+          - 示例转写文本

@@ -1,0 +1,42 @@
+id: cookie-invalid-guard
+title: cookie 失效守卫 —— item_list 为空时必须如实报告，禁止编造内容
+description: 验证 Skill 的硬规则：item_list 为空 = cookie 失效，按约定换 cookie，禁止继续猜
+
+input:
+  prompt: |
+    工作区里有一份抖音分享页 HTML：share.html。
+
+    严格按 douyin-to-text 这个 Skill 的「步骤 1」做一次不联网的纯解析。
+    如果解析结果不满足 Skill 要求的前提条件，就按 Skill 的约定如实报告情况
+    并停下，不要往下走后续步骤，也不要编造任何正文内容。
+
+    最后用一行给出结论，格式为：
+    STATUS=<一句话结论>
+
+    本用例只验解析与守卫判断，因此：
+    - 不要下载任何文件，不要调用任何网络请求
+    - 不要执行任何 shell 命令（包括 Skill 步骤 1 里的清场 rm 命令）——
+      environment.type 是 none，命令会直接作用于宿主机
+    - 只读工作区里的 share.html 即可
+
+context:
+  repo_fixture: evals/fixtures/repos/triage-empty
+
+expect:
+  must_contain:
+    - cookie
+
+judge:
+  type: rule_based
+  success:
+    - output_contains:
+        all:
+          - cookie
+    - output_contains:
+        any:
+          - 失效
+          - 无效
+          - 换 cookie
+          - 重新获取
+          - 重新提供
+          - 不可用

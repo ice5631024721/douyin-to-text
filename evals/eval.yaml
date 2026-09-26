@@ -1,0 +1,69 @@
+schema_version: v1alpha1
+
+# douyin-to-text 的评测套件（skill-upper 生成）。
+# 设计取舍：三条用例全部【不联网、不下载、不写日志】，只验 Skill 的契约面——
+# 路由判断、解析规则、守卫条件、输出模板。真实抓取链路由人工冒烟覆盖，
+# 不放进 CI 门禁（Douyin 风控 + cookie 时效 + ASR 计费都会让它变成 flaky case）。
+
+environment:
+  type: none
+
+mcp:
+  servers: []
+
+skills:
+  - source: local_path
+    # 相对 Skill 根目录（SKILL.md 所在目录）
+    path: .
+    # 安装到 workspace 内的 .dsh-skills/douyin-to-text，供被测 DSH 读取
+    target: .dsh-skills/douyin-to-text
+
+engine:
+  name: deepseek-harness
+  model:
+    provider: dashscope
+    name: qwen3.8-max
+  custom:
+    transport: local
+    conversation_mode: stateful
+    response_format: session_result
+    timeout_seconds: 300
+    env:
+      # ${api_key} 由 skill-up 凭据链解析（~/.skill-up/credentials.yaml），密钥不落 YAML
+      DSH_API_KEY: ${api_key}
+      DSH_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
+      DSH_MODEL: ${model_name}
+      # 绝对路径：被测宿主 PATH 可能极简，按名找不到二进制
+      DSH_BIN: ${SKILLUP_DSH_BIN:-/path/to/skill-up-dsh/dsh}
+      DSH_SKILLS_DIR: ${workspace}/.dsh-skills
+      DSH_TELEMETRY_MODE: DISABLED
+      DSH_PERMISSION_MODE: danger-full-access
+    local:
+      # Python 3.12+；用绝对路径
+      command: ${SKILLUP_PYTHON:-python3.12}
+      args:
+        - ${SKILLUP_DIR:-/path/to/skill-up-dsh}/dsh_runner.py
+        - --input
+        - ${input_file}
+        - --output
+        - ${output_file}
+      cwd: ${workspace}
+      input_file: .skill-up-dsh/input.json
+      output_file: .skill-up-dsh/result.json
+
+cases:
+  files:
+    - evals/cases/triage-video-share-page.yaml
+    - evals/cases/cookie-invalid-guard.yaml
+    - evals/cases/summary-output-format.yaml
+  defaults:
+    timeout_seconds: 300
+    max_turns: 6
+  parallelism: 1
+
+judge:
+  type: rule_based
+
+report:
+  formats: [json, html]
+  artifacts: [transcript, logs]
