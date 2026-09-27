@@ -224,6 +224,49 @@ def read_ass(path: Path) -> list[dict]:
     return normalize_cues(cues)
 
 
+# ---------------- 1d. 同步校验（ffsubsync）----------------
+def find_ffsubsync() -> list[str] | None:
+    """优先用 PATH 里的 ffsubsync；没有就用 uv 临时环境跑（本机 uv 在 ~/.local/bin）。"""
+    exe = shutil.which("ffsubsync")
+    if exe:
+        return [exe]
+    uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+    if Path(uv).exists():
+        return [uv, "run", "--quiet", "--with", "ffsubsync", "ffsubsync"]
+    return None
+
+
+def verify_sync(video: Path, source_srt: Path, work_dir: Path) -> dict | None:
+    """用音频 VAD + FFT 对齐校验字幕是否真的对得上视频。
+
+    实测（本机，43.8 分钟 1080p）：正对照（内嵌字幕）报 offset 0.000 / scale 1.000；
+    反证（人为把字幕挪 +3.5s）报 offset -3.500 —— 说明这道闸门真能抓偏移。
+    偏了就用 ffsubsync 自己的输出替换原文（不自己算偏移，避免符号/拉伸算错）。
+    """
+    cmd = find_ffsubsync()
+    if cmd is None:
+        print("[sync] 未找到 ffsubsync（PATH 无、uv 也缺），跳过校验", file=sys.stderr)
+        return None
+    fixed = work_dir / "synced.srt"
+    proc = subprocess.run(cmd + [str(video), "-i", str(source_srt), "-o", str(fixed), "--gss"],
+                          capture_output=True, text=True)
+    m_off = re.search(r"offset seconds:\s*(-?[\d.]+)", proc.stdout + proc.stderr)
+    m_scale = re.search(r"framerate scale factor:\s*([\d.]+)", proc.stdout + proc.stderr)
+    if not m_off or not fixed.exists():
+        print(f"[sync] 校验未完成（exit={proc.returncode}），保持原字幕", file=sys.stderr)
+        return None
+    offset = float(m_off.group(1))
+    scale = float(m_scale.group(1)) if m_scale else 1.0
+    info = {"offset": offset, "scale": scale, "fixed": False}
+    if abs(offset) > 0.3 or abs(scale - 1.0) > 0.002:
+        shutil.copy2(fixed, source_srt)
+        info["fixed"] = True
+        print(f"[sync] ⚠️ 字幕与音轨不同步（offset {offset:+.3f}s、scale {scale:.4f}）→ 已用 ffsubsync 校正", flush=True)
+    else:
+        print(f"[sync] ✅ 同步正常（offset {offset:+.3f}s、scale {scale:.4f}）", flush=True)
+    return info
+
+
 # ---------------- 1c. ASR 路线（ffmpeg 抽音轨）----------------
 def extract_audio(video: Path, audio: Path) -> float:
     info = ffprobe_json(video)
@@ -624,6 +667,28 @@ T0 = time.time()
 T = {"probe": 0.0, "audio": 0.0, "asr": 0.0, "mt": 0.0, "write": 0.0}
 
 
+def report_timing(stem: str, cues: list[dict], origin: str) -> None:
+    """打印阶段耗时并追加到 ~/.dsh/douyin-timing.log（与抖音分支共用同一份日志）。"""
+    total = time.time() - T0
+
+    def _fmt(x: float) -> str:
+        return f"{x:.1f}"
+
+    print(f"【耗时】探测 {_fmt(T['probe'])}s · 抽音轨 {_fmt(T['audio'])}s · 转写 {_fmt(T['asr'])}s · "
+          f"翻译 {_fmt(T['mt'])}s · 写盘 {_fmt(T['write'])}s · 总计 {_fmt(total)}s"
+          f"（{len(cues)} 条，{origin}）", flush=True)
+    try:
+        log = Path.home() / ".dsh/douyin-timing.log"
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write("\t".join([
+                time.strftime("%Y-%m-%d %H:%M:%S"), f"local:{stem[:40]}",
+                _fmt(T["probe"]), _fmt(T["audio"]), _fmt(T["asr"]), _fmt(T["mt"]),
+                _fmt(T["write"]), _fmt(total), str(len(cues)), str(sum(len(c["text"]) for c in cues)),
+            ]) + "\n")
+    except OSError as exc:
+        print(f"[timing] 写日志失败：{exc}", file=sys.stderr)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="视频 → 双语字幕（复用优先：内嵌字幕 > 外挂字幕 > ASR）")
     ap.add_argument("video", type=Path)
@@ -639,6 +704,10 @@ def main() -> None:
     ap.add_argument("--no-translate", action="store_true", help="只出原文 SRT")
     ap.add_argument("--no-cache", action="store_true", help="忽略译文缓存，强制重新翻译")
     ap.add_argument("--batch", type=int, default=TRANSLATE_BATCH, help="每次翻译的条数（默认 20；实测 40 会大量触发二分反而更慢）")
+    ap.add_argument("--refresh-source", action="store_true",
+                    help="强制重新抽字幕（默认会复用比视频新的 .source.srt，省掉整片读盘）")
+    ap.add_argument("--verify-sync", choices=["auto", "on", "off"], default="auto",
+                    help="用 ffsubsync 校验字幕与音轨是否同步：auto=仅外挂字幕时校验（默认）、on=总是、off=不校验")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 条字幕（小样验证用，0=全部）")
     ap.add_argument("--workers", type=int, default=4, help="翻译并发数（默认 4；受 60 次/分钟限流约束）")
     ap.add_argument("--rpm", type=int, default=REQUESTS_PER_MIN, help="每分钟最大请求数（默认 45，限流上限 60）")
@@ -659,8 +728,29 @@ def main() -> None:
 
     cues: list[dict] | None = None
     origin = ""
+    # 源字幕复用：抽内嵌字幕要把 2.8 GB 读一遍（外置机械盘实测 22 s），
+    # 上次已经抽过且比视频新就直接用，省掉这 20 秒；--refresh-source 可强制重抽。
+    cached_source = out_dir / f"{stem}.source.srt"
+    source_meta = out_dir / f"{stem}.source.json"
+    if (not args.refresh_source and args.source in ("auto", "embedded")
+            and cached_source.exists() and cached_source.stat().st_mtime >= video.stat().st_mtime):
+        meta = {}
+        try:
+            meta = json.loads(source_meta.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        cached_cues = read_srt(cached_source)
+        # 守卫：只有"完整抽取"的产物才复用。--limit 跑过的那份会被截断，复用它会静默少出字幕。
+        if meta.get("limited"):
+            print(f"[src] 已有的 {cached_source.name} 来自 --limit 运行，不复用", flush=True)
+        elif not cached_cues:
+            print(f"[src] {cached_source.name} 为空，不复用", flush=True)
+        else:
+            cues = cached_cues
+            origin = "复用的 source.srt（跳过抽取）"
+            print(f"[src] 复用 {cached_source.name}（{len(cues)} 条，比视频新，跳过整片读盘）", flush=True)
     _stage = time.time()
-    if args.source in ("auto", "embedded"):
+    if cues is None and args.source in ("auto", "embedded"):
         tracks = embedded_tracks(video)
         text_tracks = [t for t in tracks if t["text_based"]]
         if tracks:
@@ -715,10 +805,22 @@ def main() -> None:
 
     source_srt = out_dir / f"{stem}.source.srt"
     write_srt(cues, source_srt, wrap_source=False)
+    (out_dir / f"{stem}.source.json").write_text(json.dumps(
+        {"cues": len(cues), "limited": bool(args.limit), "origin": origin,
+         "video_mtime": video.stat().st_mtime}, ensure_ascii=False), encoding="utf-8")
+
+    # 同步校验：外挂/下载来的字幕可能与视频不同版本 —— 用音频对齐验一次（auto 时仅外挂字幕触发）
+    if args.verify_sync == "on" or (args.verify_sync == "auto" and origin.startswith("外挂")):
+        if verify_sync(video, source_srt, out_dir):
+            cues = read_srt(source_srt)          # 用校正后的字幕重建时间轴
+            print(f"[sync] 已应用校正后的时间轴（{len(cues)} 条）", flush=True)
 
     if args.no_translate:
+        _stage = time.time()
         final = out_dir / f"{stem}.srt"
         write_srt(cues, final, wrap_source=False)
+        T["write"] = time.time() - _stage
+        report_timing(stem, cues, origin)
         print(f"[done] {final}")
         return
 
@@ -760,22 +862,7 @@ def main() -> None:
     write_srt(cues, final, translations, wrap_source=origin.startswith("ASR"))
     T["write"] = time.time() - _stage
 
-    total = time.time() - T0
-    def _fmt(x: float) -> str:
-        return f"{x:.1f}"
-    print(f"【耗时】探测 {_fmt(T["probe"])}s · 抽音轨 {_fmt(T["audio"])}s · 转写 {_fmt(T["asr"])}s · "
-          f"翻译 {_fmt(T["mt"])}s · 写盘 {_fmt(T["write"])}s · 总计 {_fmt(total)}s"
-          f"（{len(cues)} 条，{origin}）", flush=True)
-    try:  # 与抖音分支共用一份时间日志，便于跨次比较
-        log = Path.home() / ".dsh/douyin-timing.log"
-        with log.open("a", encoding="utf-8") as fh:
-            fh.write("\t".join([
-                time.strftime("%Y-%m-%d %H:%M:%S"), f"local:{stem[:40]}",
-                _fmt(T["probe"]), _fmt(T["audio"]), _fmt(T["asr"]), _fmt(T["mt"]),
-                _fmt(T["write"]), _fmt(total), str(len(cues)), str(sum(len(c["text"]) for c in cues)),
-            ]) + "\n")
-    except OSError as exc:
-        print(f"[timing] 写日志失败：{exc}", file=sys.stderr)
+    report_timing(stem, cues, origin)
     print(f"[done] {final}")
 
 
