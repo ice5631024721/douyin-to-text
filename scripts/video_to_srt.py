@@ -74,23 +74,26 @@ def find_bl() -> str:
     raise SystemExit("找不到 bl（bailian-cli）：npm install -g bailian-cli（见 ASR-API.md）")
 
 
-def bl_env() -> dict:
-    """bl 是 npm shim（#!/usr/bin/env node）：node 不在 PATH 上时它会以 exit=127 静默空返回。
+def tool_env() -> dict:
+    """给子进程用的 PATH：前置 ffmpeg/uv/node/bl 所在目录。
 
-    实测坑（2026-09-27）：DSH/GUI 会话的 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，
-    直接调 bl 会 20 个批次全部拿到空 stdout，看起来像"模型没返回译文"。
-    这里把 bl 所在目录（fnm/global 布局里 node 与它同级）前置进 PATH。
+    DSH 里 bash 子进程的 PATH 可能只有 /usr/bin:/bin:/usr/sbin:/sbin，
+    而 ffsubsync 这类工具内部是按名字调 `ffmpeg` 的 —— 不前置就会静默失败。
     """
     env = os.environ.copy()
-    bl_dir = str(Path(find_bl()).parent)
-    parts = [bl_dir]
-    if not shutil.which("node", path=env.get("PATH", "")):
-        parts.append(bl_dir)  # node 通常与 bl 同目录
-        for extra in (Path.home() / ".local/bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin")):
-            if Path(extra).exists():
-                parts.append(str(extra))
-    env["PATH"] = os.pathsep.join(parts + [env.get("PATH", "")])
+    parts = [str(Path(FFMPEG).parent), str(Path.home() / ".local/bin"),
+             str(Path.home() / ".local/share/fnm/node-versions/v24.15.0/installation/bin")]
+    try:
+        parts.append(str(Path(find_bl()).parent))
+    except SystemExit:
+        pass
+    env["PATH"] = ":".join(parts + [env.get("PATH", "")])
     return env
+
+
+def bl_env() -> dict:
+    """bl 专用环境（等价于 tool_env，保留名字是因为调用点多）。"""
+    return tool_env()
 
 
 def api_key(explicit: str | None) -> str:
@@ -127,7 +130,7 @@ def ffprobe_json(video: Path) -> dict:
         [FFPROBE, "-v", "error", "-probesize", "20M", "-analyzeduration", "20M", "-show_entries",
          "stream=index,codec_type,codec_name:stream_tags=language,title:format=duration",
          "-of", "json", str(video)],
-        capture_output=True, text=True)
+        capture_output=True, text=True, env=tool_env())
     if proc.returncode != 0:
         raise SystemExit(f"ffprobe 失败：{proc.stderr.strip()[:200]}")
     return json.loads(proc.stdout or "{}")
@@ -249,11 +252,12 @@ def verify_sync(video: Path, source_srt: Path, work_dir: Path) -> dict | None:
         return None
     fixed = work_dir / "synced.srt"
     proc = subprocess.run(cmd + [str(video), "-i", str(source_srt), "-o", str(fixed), "--gss"],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=tool_env())
     m_off = re.search(r"offset seconds:\s*(-?[\d.]+)", proc.stdout + proc.stderr)
     m_scale = re.search(r"framerate scale factor:\s*([\d.]+)", proc.stdout + proc.stderr)
     if not m_off or not fixed.exists():
-        print(f"[sync] 校验未完成（exit={proc.returncode}），保持原字幕", file=sys.stderr)
+        detail = (proc.stderr or proc.stdout or "")[-300:].replace("\n", " ")
+        print(f"[sync] 校验未完成（exit={proc.returncode}）：{detail}", file=sys.stderr)
         return None
     offset = float(m_off.group(1))
     scale = float(m_scale.group(1)) if m_scale else 1.0

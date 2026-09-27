@@ -126,6 +126,7 @@ cp "<视频基名>.srt" ~/Library/Caches/dev.selfvideo.player/selfvideo/subs/   
 ### 这条分支的坑（实测）
 
 - **`ffmpeg`/`ffprobe` 必须是好的**：本机曾断链（ffprobe 指向已删 Cellar、ffmpeg 缺 libx264），2026-09-27 `brew reinstall ffmpeg` 修好，二者均为 9.0.2（`/opt/homebrew/bin`）。**一律用 ffmpeg/ffprobe，不用 PyAV**。
+- **子进程一律带 PATH（`tool_env()`）**：DSH 里 bash 子进程的 PATH 可能只有 `/usr/bin:/bin:/usr/sbin:/sbin`。ffsubsync 这类工具**内部按名字调 `ffmpeg`**，不前置 `/opt/homebrew/bin` 就会 `exit=1` 静默空转（实测：同步校验变成"校验未完成，保持原字幕"）。脚本已统一走 `tool_env()`（前置 ffmpeg/uv/node/bl 目录），失败时还会打印真实 stderr。
 - **`bl` 是 npm shim（`#!/usr/bin/env node`）**：PATH 里没有 node 时它以 exit=127 **静默空返回**（症状：整批翻译返回 0 条却无报错）。脚本用 `bl_env()` 把 bl 所在目录前置进子进程 PATH。
 - **同步 ASR 上限 300 秒**；要整片一次过且要时间戳，用异步模型（`*-filetrans`/`fun-asr`/`paraformer-*`）配 `--out <json>`。`bl speech` **没有翻译子命令**。
 - **`bl text chat --output json` 可能直接输出模型正文（JSON 数组）**；`qwen-mt-*` 系列**不接受 system 角色**（报 `Role must be in [user, assistant]`）——脚本对三种返回形态都做了兼容。
