@@ -59,44 +59,69 @@ curl 逐张下载 `images[i].url_list[0]` 到 /tmp/dy_img_N.jpeg，用 read_imag
 
 给一个本地视频（MKV/MP4 都行）产出双语字幕。**复用优先：能拿到现成字幕就绝不转写。**
 
-| 优先级 | 来源 | 说明 |
+| 优先级 | 来源 | 做法 |
 |---|---|---|
-| 1 | **内嵌字幕轨** | MKV/MP4 里的 srt/ass/文本轨（含 SDH）→ 直接复用**原时间轴**，零 ASR 成本，且人工字幕比转写更准 |
-| 2 | **同目录外挂字幕** | `<视频基名>.srt` / `.ass` / `.vtt`（含带语言后缀的同名文件）→ 同上 |
-| 3 | **ASR 转写** | 前两者都没有才走：PyAV 解 16 kHz 单声道 FLAC → `bl speech recognize` 异步 filetrans（句级 begin/end ＋词级时间戳）→ 按字幕规范切 cue |
+| 1 | **内嵌字幕轨** | `ffprobe` 探轨 → `ffmpeg -map 0:<idx> -c:s srt` 抽成 SRT → **复用原时间轴**，零 ASR 成本，比转写更准 |
+| 2 | **同目录外挂字幕** | `<视频基名>.srt` / `.ass` / `.vtt` 直接读 |
+| 3 | **ASR 转写** | `ffmpeg -vn -ac 1 -ar 16000 -c:a flac` 抽音轨 → `bl speech recognize` 异步 filetrans（句级 `begin_time/end_time` ＋ 词级 `words[]`）→ 按字幕规范切 cue |
 
-拿到原文后统一用 `bl text chat`（默认 `qwen3.8-flash`；`--chat-model qwen3.8-max` 质量略高但约慢一倍）批量**并行**翻译，输出「原文行 ＋ 译文行」的双语 SRT。
+拿到原文后翻译：**默认云端 `qwen-mt-flash`**（`bl text chat`），可 `--backend local` 切本地 llama.cpp / mlx-lm 的 OpenAI 兼容服务。
 
 ```bash
-~/.local/bin/uv run --with av --with numpy python \
-  ~/.dsh/skills/douyin-to-text/scripts/video_to_srt.py "<视频>" \
-  --out <输出目录> [--source auto|embedded|sidecar|asr] [--source-lang en] \
-  [--target-lang zh] [--sub-index N] [--no-translate] [--asr-json <已有.json>]
+python ~/.dsh/skills/douyin-to-text/scripts/video_to_srt.py "<视频>" \
+  --out <输出目录> [--source auto|embedded|sidecar|asr] [--source-lang en] [--target-lang zh] \
+  [--sub-index N] [--chat-model qwen-mt-flash] [--backend cloud|local] \
+  [--local-server http://127.0.0.1:8080] [--batch 20] [--workers 4] [--asr-json <已有.json>]
 ```
 
-产出：`<视频基名>.srt`（双语）、`<视频基名>.source.srt`（复用的原文，便于复查/重译）、ASR 路线的 `<视频基名>.asr.json`。**重切不重付**：`--asr-json` 跳过解音轨与转写，只重切/重译。
+产出：`<视频基名>.srt`（双语）、`.source.srt`（复用的原文）、`.<lang>.json`（译文缓存，按原文指纹校验，**重切不重付**）。
 
-实测（Undercover.Billionaire S01E02，43.8 分钟 1080p MKV）：内嵌 `eng/SDH` 文本轨 766 条 → 清洗后 765 条，时间轴 00:00:02 → 00:43:45，与视频长度一致；全程零 ASR 调用，只付翻译。
+实测（一部 43.8 分钟 1080p MKV，内嵌 `eng/SDH` 字幕轨 766 条 → 清洗后 765 条）：
+
+| 阶段 | 耗时 | 关键点 |
+|---|---|---|
+| 探测＋抽内嵌字幕 | **3 s（热）/ 22.7 s（冷盘）** | 必须带 `-probesize 20M -analyzeduration 20M`，但它不是主要成本：MKV 的字幕包散布全文件，ffmpeg 要读完 3 GB 才能抽全，外置盘冷读就是 20 秒级 |
+| 翻译 765 条 | **≈100 s** | qwen-mt-flash，**20 条/批 × 4 并发**（120 条小样实测 15 s） |
+| 合计 | **≈2 分钟** | 全程无 ASR 调用，成本 ≈0.03 元 |
+
+质检：765/765 条有中文、0 重叠、0 乱序、无 >15 s 空隙；时间轴 `00:00:02 → 00:43:45` 与片长 2628.032 s 对齐。
+
+**三个实测反例（都踩过，别再走）**：
+- **批大小 40 → 136 次二分、399 秒**：模型会把短句（`(RETCHES)`、`Mmm.`）并进相邻行，条数不符就二分，越大越糟。**20 是实测最优点**。
+- **逐行翻译 → 触发 429**：qwen-mt-flash 限 **60 次/分钟 + 3.5 万 token/分钟**；765 次单行请求必被限流，退避比并发更慢。脚本内置限速器（默认 50 次/分钟）。
+- **"末尾补空"对齐 → 整批错位**：条数不符时补空会把译文按错位映射出去（表现为中文里混英文）。脚本改为**递归二分 + 成批补译**，绝不补空。
+
+**小样验证**：改 prompt/协议时别拿整片试——`--limit 120` 只翻前 120 条，20 秒出结果；确认后再跑全片（译文有缓存，重复跑不重付）。
 
 ### 装进 selfvideo
 
 selfvideo 用 mpv 垫底、没关 `config`（`~/.config/mpv/` 为空），mpv 默认 `sub-auto=exact`：**SRT 命名成与视频同名、放同目录即自动加载**。
 
 ```bash
-cp "<视频基名>.srt" "<视频所在目录>/<视频基名>.srt"                        # mpv 自动加载
-cp "<视频基名>.srt" ~/Library/Caches/dev.selfvideo.player/selfvideo/subs/   # 应用字幕缓存
+cp "<视频基名>.srt" "<视频所在目录>/<视频基名>.srt"                          # mpv 自动加载
+cp "<视频基名>.srt" ~/Library/Caches/dev.selfvideo.player/selfvideo/subs/     # 应用字幕缓存
 ```
 
-（selfvideo 字幕链路：provider → `~/Library/Caches/dev.selfvideo.player/selfvideo/subs/` → mpv `sub-add`，见 `src-tauri/src/subs/mod.rs` 的 `sub_load`；mpv 启动选项在 `src-tauri/src/lib.rs`。）
+（selfvideo 字幕链路：provider → `~/Library/Caches/dev.selfvideo.player/selfvideo/subs/` → mpv `sub-add`，见 `src-tauri/src/subs/mod.rs` 的 `sub_load`。）
+
+### 翻译后端选型（2026-09-27 实测，Apple M4/32GB，20 条真实字幕）
+
+| 后端 | 模型 | 20 条耗时 | decode | 内存 | 一集(765条) | 质量（中立裁判，位置互换） |
+|---|---|---|---|---|---|---|
+| **云端（默认）** | `qwen-mt-flash` | **1.8 s** | — | — | **≈70 s / ≈0.03 元** | 略优：更口语化、会本地化人名 |
+| 本地 | Hy-MT2-7B GGUF Q4_K_M（llama.cpp） | 13.2 s | 19.95 tok/s | 4.06 GB | ≈5.7–8.4 分 | 与云端基本持平（6:6、6:7），术语更准（`(RETCHES)`→「干呕声」） |
+| 本地 | Hy-MT2-7B MLX 8bit | 22.5 s | 12.0 tok/s | 8.26 GB | ≈14 分 | 大致同级（结论受 20 条小样本/裁判差异影响） |
+
+**结论：生产用云端 `qwen-mt-flash`；离线/隐私场景用本地 llama.cpp Q4**（本地服务起法：`llama-server -m <gguf> --port 8080 -ngl 99`，再 `--backend local`）。
 
 ### 这条分支的坑（实测）
 
-- **`bl` 是 npm shim（`#!/usr/bin/env node`）：PATH 里没有 node 时它以 exit=127 静默空返回**——症状是"20 个翻译批次全部返回 0 条"却毫无报错。脚本用 `bl_env()` 把 bl 所在目录前置进子进程 PATH；凡是调用 `bl` 的脚本都要做这件事（本机 GUI 会话 PATH 默认只有 `/usr/bin:/bin:/usr/sbin:/sbin`）。
-- **ffmpeg/ffprobe 断链**：`ffprobe` 指向已删 Cellar 版本、`ffmpeg` 9.0.2 缺 `libx264.165.dylib`、`ffmpeg@7` 无 bin → 一律 PyAV（`uv run --with av`），别去修 brew。macOS 原生 `afconvert` **读不了 MKV**。
-- **同步 ASR 上限 300 秒**；要整片一次过且要时间戳，用异步模型（`*-filetrans` / `fun-asr` / `paraformer-*`）配 `--out <json>`。
-- **`bl text chat --output json` 可能直接输出模型正文（JSON 数组）而非包装对象**——解析要同时吃 list、`{choices:[{message:{content}}]}`、裸文本三种形态。
-- **翻译批次并行**（默认 8 并发），结果按批索引回填，顺序不会乱；返回条数与输入不符的批次告警并按序兜底。
-- SDH 底本含 `GLENN STEARNS:` 这类说话人标签与 `[door slams]`、`♪` 等注释——翻译提示词里已要求原样保留。
+- **`ffmpeg`/`ffprobe` 必须是好的**：本机曾断链（ffprobe 指向已删 Cellar、ffmpeg 缺 libx264），2026-09-27 `brew reinstall ffmpeg` 修好，二者均为 9.0.2（`/opt/homebrew/bin`）。**一律用 ffmpeg/ffprobe，不用 PyAV**。
+- **`bl` 是 npm shim（`#!/usr/bin/env node`）**：PATH 里没有 node 时它以 exit=127 **静默空返回**（症状：整批翻译返回 0 条却无报错）。脚本用 `bl_env()` 把 bl 所在目录前置进子进程 PATH。
+- **同步 ASR 上限 300 秒**；要整片一次过且要时间戳，用异步模型（`*-filetrans`/`fun-asr`/`paraformer-*`）配 `--out <json>`。`bl speech` **没有翻译子命令**。
+- **`bl text chat --output json` 可能直接输出模型正文（JSON 数组）**；`qwen-mt-*` 系列**不接受 system 角色**（报 `Role must be in [user, assistant]`）——脚本对三种返回形态都做了兼容。
+- **`bl text chat` 默认超时偏短**：并发下会 `ETIMEDOUT`，必须 `--timeout 180`；单批失败重试 3 次，仍失败二分（末尾补空会让整批译错位）。
+- **模型下线**：`qwen-mt-turbo`、`gummy-chat-v1`、`gummy-realtime-v1` 于 **2026-10-10** 下线（目录字段 `upcomingOfflineAt`，公告 [aliyun.com/notice/118434](https://www.aliyun.com/notice/118434)）；替代见 `ASR-API.md`。
 - macOS 无 `timeout`；整片转写/翻译放后台作业跑。
 
 ## 计时

@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 """视频 → 双语字幕（SRT），时间轴与视频一一对应。
 
-**复用优先（不重复造轮子）**：能拿到现成字幕就不转写——
-  1. 内嵌字幕轨（MKV/MP4 的 srt/ass 文本轨，含 SDH）→ 直接复用原时间轴，零 ASR 成本
-  2. 同目录外挂字幕（<视频基名>.srt / .ass / .vtt / 同名带语言后缀）→ 直接复用
-  3. 都没有才转写（ASR）——用 PyAV 解音轨 + bl 异步 filetrans 拿句级/词级时间戳
-再用 bl text chat 把原文批量译成目标语言，输出「原文行 + 译文行」的双语 SRT。
+复用优先（不重复造轮子）：能拿到现成字幕就不转写——
+  1. 内嵌字幕轨（MKV/MP4 的 srt/ass 文本轨，含 SDH）→ ffprobe 探轨 + ffmpeg 抽取，零 ASR 成本
+  2. 同目录外挂字幕（<视频基名>.srt / .ass / .vtt）→ 直接复用
+  3. 都没有才转写（ASR）→ ffmpeg 抽 16k 单声道 + bl 异步 filetrans 拿句级/词级时间戳
+再翻译：默认云端 bl text chat（qwen-mt-flash），--backend local 可切本地 llama.cpp / mlx-lm
+的 OpenAI 兼容服务；输出「原文行 + 译文行」的双语 SRT。
 
-为什么是这套组合（全部本机已装，不依赖坏掉的系统 ffmpeg）：
-  * 解音轨/解字幕：PyAV（uv 提供，wheel 自带 FFmpeg 库）——本机 ffmpeg/ffprobe 断链
-    （x264 dylib 缺失、ffmpeg@7 无 bin），macOS 原生 afconvert 又读不了 MKV。
-  * 转写：bl speech recognize --model qwen-audio-3.1-asr-flash-filetrans（异步）
-  * 翻译：bl text chat（同一 CLI、同一把 key，OpenAI 兼容端点）
+工具链（全部本机已装）：ffmpeg / ffprobe（/opt/homebrew/bin，2026-09-27 用 brew 修好）、
+bailian CLI（bl，ASR 与云端翻译）、可选 llama-server（本地翻译）。
+注意：qwen-mt-turbo 与 gummy-* 于 2026-10-10 下线，默认翻译模型取 qwen-mt-flash。
 
 跑法：
-  ~/.local/bin/uv run --with av --with numpy python video_to_srt.py <video> \
-      [--out <dir>] [--source auto|embedded|sidecar|asr] [--target-lang zh] \
-      [--sub-index N] [--sub-lang eng] [--asr-model ...] [--chat-model qwen3.8-flash] \
-      [--no-translate] [--keep-audio] [--asr-json <已有.json>]
+  python video_to_srt.py <video> [--out <dir>] [--source auto|embedded|sidecar|asr]
+      [--source-lang en] [--target-lang zh] [--sub-index N] [--asr-model ...]
+      [--chat-model qwen-mt-flash] [--backend cloud|local] [--local-server URL]
+      [--asr-json <已有.json>] [--no-translate] [--batch 40] [--workers 5]
 
-产出：
-  <out>/<视频基名>.srt        双语；--no-translate 时只有原文
-  <out>/<视频基名>.source.srt 复用的原字幕（内嵌提取或外挂复制），便于复查/重译
+产出：<out>/<视频基名>.srt（双语）、.source.srt（复用的原文）、.<lang>.json（译文缓存，重切不重付）
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -34,18 +32,32 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import urllib.request
+import time
 from pathlib import Path
 
+FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+FFPROBE = shutil.which("ffprobe") or "/opt/homebrew/bin/ffprobe"
 ASR_MODEL_DEFAULT = "qwen-audio-3.1-asr-flash-filetrans"
 # 实测（2026-09-27，765 条字幕）：flash 与 max 译文质量相当，flash 快约一倍
-CHAT_MODEL_DEFAULT = "qwen3.8-flash"
+# qwen-mt-turbo 与 gummy-* 于 2026-10-10 下线；qwen-mt-flash 同价同档且在售（见 ASR-API.md）
+CHAT_MODEL_DEFAULT = "qwen-mt-flash"
+LOCAL_SERVER_DEFAULT = "http://127.0.0.1:8080"
+DELIM = "\n|||\n"
+LOCAL_PROMPT = ("请将以下文本准确翻译为中文。你必须在译文中保留等量的分隔符 ||| ，"
+                "绝对不可遗漏、转义或翻译该符号，并注意分隔符的位置。\n\n")
 TEXT_SUB_CODECS = {"srt", "subrip", "ass", "ssa", "mov_text", "webvtt", "text"}
 SIDECAR_EXTS = (".srt", ".ass", ".ssa", ".vtt")
 MAX_LINE_CHARS = 42          # 仅 ASR 路线需要重切时用
 MAX_CUE_MS = 7000
 MIN_CUE_MS = 800
 MIN_GAP_MS = 40
-TRANSLATE_BATCH = 40
+REQUESTS_PER_MIN = 50   # qwen-mt-flash 限额：60 次/分钟 + 3.5 万 token/分钟；留安全余量
+TRANSLATE_BATCH = 20   # 实测 40 条/批会频繁触发"模型合并短句→条数不符→二分"，20 条最稳最快
+TRANSLATE_TIMEOUT = 180   # bl --timeout：实测 8 并发下偶发 ETIMEDOUT，给足时间
+TRANSLATE_ATTEMPTS = 3    # 单批最多重试次数（失败后二分）
+ASR_TIMEOUT = 600
 
 
 def find_bl() -> str:
@@ -109,68 +121,59 @@ def parse_ts(text: str) -> int:
     return int(h) * 3600000 + int(m) * 60000 + int(s) * 1000 + int((ms or "0").ljust(3, "0")[:3])
 
 
-# ---------------- 1a. 内嵌字幕轨 ----------------
-def embedded_tracks(video: Path) -> list[dict]:
-    import av
+# ---------------- 1a. 内嵌字幕轨（ffprobe 探轨 + ffmpeg 抽取）----------------
+def ffprobe_json(video: Path) -> dict:
+    proc = subprocess.run(
+        [FFPROBE, "-v", "error", "-probesize", "20M", "-analyzeduration", "20M", "-show_entries",
+         "stream=index,codec_type,codec_name:stream_tags=language,title:format=duration",
+         "-of", "json", str(video)],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(f"ffprobe 失败：{proc.stderr.strip()[:200]}")
+    return json.loads(proc.stdout or "{}")
 
-    ctx = av.open(str(video))
+
+def embedded_tracks(video: Path) -> list[dict]:
     tracks = []
-    for stream in ctx.streams:
-        if stream.type != "subtitle":
+    for st in ffprobe_json(video).get("streams") or []:
+        if st.get("codec_type") != "subtitle":
             continue
-        meta = dict(stream.metadata or {})
-        tracks.append({
-            "index": stream.index,
-            "codec": stream.codec_context.name,
-            "lang": (meta.get("language") or "").lower(),
-            "title": meta.get("title") or "",
-            "text_based": stream.codec_context.name.lower() in TEXT_SUB_CODECS,
-        })
+        tags = st.get("tags") or {}
+        codec = (st.get("codec_name") or "").lower()
+        tracks.append({"index": st.get("index"), "codec": codec,
+                       "lang": (tags.get("language") or "").lower(),
+                       "title": tags.get("title") or "",
+                       "text_based": codec in TEXT_SUB_CODECS})
     return tracks
 
 
 def extract_embedded(video: Path, index: int | None, prefer_lang: str | None) -> tuple[list[dict], dict]:
-    import av
-
-    ctx = av.open(str(video))
-    streams = [s for s in ctx.streams if s.type == "subtitle"]
-    if not streams:
+    tracks = embedded_tracks(video)
+    if not tracks:
         raise SystemExit("视频里没有字幕轨")
-    stream = None
+    track = None
     if index is not None:
-        stream = next((s for s in streams if s.index == index), None)
-        if stream is None:
+        track = next((t for t in tracks if t["index"] == index), None)
+        if track is None:
             raise SystemExit(f"没有 idx={index} 的字幕轨")
     else:
-        text_streams = [s for s in streams if s.codec_context.name.lower() in TEXT_SUB_CODECS]
-        pool = text_streams or streams
+        pool = [t for t in tracks if t["text_based"]] or tracks
         if prefer_lang:
-            stream = next((s for s in pool
-                           if (dict(s.metadata or {}).get("language") or "").lower().startswith(prefer_lang)), None)
-        stream = stream or pool[0]
-    info = {"index": stream.index, "codec": stream.codec_context.name, **dict(stream.metadata or {})}
-    tb = stream.time_base
-    raw_cues: list[dict] = []
-    for packet in ctx.demux(stream):
-        if packet.size == 0:
-            continue
-        try:
-            data = bytes(packet)
-        except Exception:
-            data = packet.to_bytes()
-        text = data.decode("utf-8", "replace")
-        text = re.sub(r"\{[^}]*\}", "", text)                      # ASS 样式块
-        text = re.sub(r"<[^>]+>", "", text)                        # HTML 标签
-        text = re.sub(r"\\([Nnh])", "\n", text).strip()             # ASS 硬换行
-        if not text:
-            continue
-        begin = int(packet.pts * tb * 1000) if packet.pts is not None else None
-        duration = int(packet.duration * tb * 1000) if packet.duration else None
-        if begin is None:
-            continue
-        raw_cues.append({"begin": begin, "end": begin + duration if duration else None, "text": text})
-    cues = normalize_cues(raw_cues)
-    return cues, info
+            track = next((t for t in pool if t["lang"].startswith(prefer_lang)), None)
+        track = track or pool[0]
+    if not track["text_based"]:
+        raise SystemExit(f"字幕轨 idx={track['index']} 是图形字幕（{track['codec']}），需要先 OCR")
+    with tempfile.TemporaryDirectory(prefix="v2srt-sub-") as tmp:
+        raw_srt = Path(tmp) / "sub.srt"
+        proc = subprocess.run([FFMPEG, "-v", "error", "-y", "-probesize", "20M", "-analyzeduration", "20M",
+                               "-i", str(video),
+                               "-map", f"0:{track['index']}", "-c:s", "srt", str(raw_srt)],
+                              capture_output=True, text=True)
+        if proc.returncode != 0 or not raw_srt.exists():
+            raise SystemExit(f"ffmpeg 抽字幕失败：{proc.stderr.strip()[:200]}")
+        cues = read_srt(raw_srt)
+    return cues, {"index": track["index"], "codec": track["codec"],
+                  "language": track["lang"], "title": track["title"]}
 
 
 # ---------------- 1b. 外挂字幕 ----------------
@@ -221,43 +224,29 @@ def read_ass(path: Path) -> list[dict]:
     return normalize_cues(cues)
 
 
-# ---------------- 1c. ASR 路线 ----------------
+# ---------------- 1c. ASR 路线（ffmpeg 抽音轨）----------------
 def extract_audio(video: Path, audio: Path) -> float:
-    import av
-
-    ctx = av.open(str(video))
-    stream = next((s for s in ctx.streams if s.type == "audio"), None)
+    info = ffprobe_json(video)
+    duration = float((info.get("format") or {}).get("duration") or 0)
+    stream = next((x for x in (info.get("streams") or []) if x.get("codec_type") == "audio"), None)
     if stream is None:
         raise SystemExit(f"{video} 里没有音频流")
-    duration = float(ctx.duration) / av.time_base if ctx.duration else 0.0
-    print(f"[audio] {stream.codec_context.name} {stream.rate}Hz {stream.channels}ch dur={duration:.0f}s", flush=True)
-    resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=16000)
-    out = av.open(str(audio), "w")
-    ostream = out.add_stream("flac", rate=16000)
-    ostream.layout = "mono"
-    total = 0
-    for frame in ctx.decode(stream):
-        for resampled in resampler.resample(frame):
-            for packet in ostream.encode(resampled):
-                out.mux(packet)
-            total += resampled.samples
-    for resampled in resampler.resample(None):
-        for packet in ostream.encode(resampled):
-            out.mux(packet)
-        total += resampled.samples
-    for packet in ostream.encode(None):
-        out.mux(packet)
-    out.close()
-    seconds = total / 16000
-    print(f"[audio] {seconds:.1f}s → {audio.name} ({audio.stat().st_size/1e6:.1f} MB)", flush=True)
-    return seconds
+    print(f"[audio] {stream.get('codec_name')} → 16kHz 单声道", flush=True)
+    proc = subprocess.run([FFMPEG, "-v", "error", "-y", "-i", str(video),
+                           "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac", str(audio)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0 or not audio.exists():
+        raise SystemExit(f"ffmpeg 抽音轨失败：{proc.stderr.strip()[:200]}")
+    print(f"[audio] {duration:.0f}s → {audio.name} ({audio.stat().st_size/1e6:.1f} MB)", flush=True)
+    return duration
 
 
 def transcribe(audio: Path, out_json: Path, key: str, model: str, lang: str) -> dict:
     print(f"[asr] {model} ← {audio.name}", flush=True)
     proc = subprocess.run(
         [find_bl(), "speech", "recognize", "--url", str(audio), "--model", model,
-         "--language", lang, "--out", str(out_json), "--output", "json", "--api-key", key],
+         "--language", lang, "--out", str(out_json), "--output", "json",
+         "--api-key", key, "--timeout", str(ASR_TIMEOUT)],
         capture_output=True, text=True, env=bl_env(),
     )
     if proc.returncode != 0 or not out_json.exists():
@@ -360,86 +349,227 @@ def normalize_cues(cues: list[dict]) -> list[dict]:
 
 
 # ---------------- 2. 翻译 ----------------
-def _translate_batch(batch: list[str], key: str, chat_model: str, system: str) -> list[str]:
-    payload = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": json.dumps({"lines": batch}, ensure_ascii=False)},
-    ]
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False)
-        msg_file = handle.name
+class _RateLimiter:
+    """按"每分钟 N 次"节流。百炼 qwen-mt-flash 限 60 次/分钟，超了就是一串 429 退避（比限速更慢）。"""
+
+    def __init__(self, rpm: int) -> None:
+        self._interval = 60.0 / max(1, rpm)
+        self._lock = threading.Lock()
+        self._next_at = time.monotonic()
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if now < self._next_at:
+                time.sleep(self._next_at - now)
+                now = time.monotonic()
+            self._next_at = now + self._interval
+
+
+_LIMITER: "_RateLimiter | None" = None
+
+# 目标：**少往返 + 不错位**。实测（qwen-mt-flash，20 条/批）单批约 1.8–2 s；
+# 逐行翻译要 765 次往返且触发 429 限流，所以批量优先、错位才二分、补译也成批。
+def _translate_local(batch: list[str], server: str, timeout: int) -> list[str] | None:
+    """本地后端：llama.cpp / mlx-lm 的 OpenAI 兼容 /v1/chat/completions（Hy-MT2 官方分隔符模板）。"""
+    prompt = LOCAL_PROMPT + DELIM.join(batch)
+    payload = {"model": "local", "messages": [{"role": "user", "content": prompt}],
+               "temperature": 0.7, "top_p": 0.6, "top_k": 20,
+               "repetition_penalty": 1.05, "max_tokens": 4096, "stream": False}
+    req = urllib.request.Request(server.rstrip("/") + "/v1/chat/completions",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
     try:
-        proc = subprocess.run(
-            [find_bl(), "text", "chat", "--model", chat_model, "--messages-file", msg_file,
-             "--api-key", key, "--output", "json", "--quiet"],
-            capture_output=True, text=True, env=bl_env(),
-        )
-        if proc.returncode != 0:
-            sys.stderr.write(proc.stdout[-800:] + proc.stderr[-800:])
-            raise SystemExit(f"bl text chat 失败（exit={proc.returncode}）——"
-                             f"常见原因：node 不在 PATH（见 bl_env 注释）或 key/额度问题")
-        raw = proc.stdout
-        translated: list[str] = []
-        content = raw
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+    except Exception as exc:
+        print(f"[mt] 本地服务失败：{type(exc).__name__} {str(exc)[:110]}", file=sys.stderr)
+        return None
+    text = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    parts = [x.strip() for x in text.split("|||")]
+    return parts if len(parts) == len(batch) else None
+
+
+def _cloud_payload(batch: list[str], chat_model: str, system: str) -> list[dict]:
+    """构造请求体。qwen-mt-* 只吃 user/assistant（带 system 会 400）。"""
+    if not chat_model.startswith("qwen-mt"):
+        return [{"role": "system", "content": system},
+                {"role": "user", "content": json.dumps({"lines": batch}, ensure_ascii=False)}]
+    if len(batch) == 1:
+        return [{"role": "user", "content": "把下面这句英文翻译成简体中文，只输出译文：\n" + batch[0]}]
+    # 多行用 JSON 数组协议：一次 20 条约 2 s，是当前最省的往返方式
+    return [{"role": "user", "content":
+             "将下面的英文逐行翻译成简体中文，只输出 JSON 数组，条数与输入一致，不要额外解释：\n"
+             + json.dumps(batch, ensure_ascii=False)}]
+
+
+def _ask_cloud(batch: list[str], key: str, chat_model: str, system: str,
+               timeout: int = TRANSLATE_TIMEOUT) -> list[str] | None:
+    """一次云端请求。返回 None = 失败或条数不符（交由上层二分），绝不猜测对齐关系。"""
+    payload = _cloud_payload(batch, chat_model, system)
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+        msg_file = fh.name
+    try:
+        raw = ""
+        for attempt in range(1, TRANSLATE_ATTEMPTS + 1):
+            proc = subprocess.run(
+                [find_bl(), "text", "chat", "--model", chat_model, "--messages-file", msg_file,
+                 "--api-key", key, "--output", "json", "--quiet", "--timeout", str(timeout)],
+                capture_output=True, text=True, env=bl_env())
+            raw = proc.stdout
+            if proc.returncode == 0 and raw.strip():
+                break
+            detail = (proc.stderr or raw)[-160:].replace("\n", " ")
+            print(f"[mt] 第 {attempt}/{TRANSLATE_ATTEMPTS} 次失败：{detail}", file=sys.stderr)
+            if attempt < TRANSLATE_ATTEMPTS:
+                time.sleep(2 * attempt)          # 429 限流时退避
+        else:
+            return None
+        if '"error"' in raw[:200] and '"code"' in raw[:600]:
+            return None
+
+        content: str | None = None
         try:
             parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                # bl text chat --output json 在部分版本里直接输出模型正文（JSON 数组）
-                translated = [str(x) for x in parsed]
-            elif isinstance(parsed, dict):
-                node = parsed
-                choices = node.get("choices")
-                if isinstance(choices, list) and choices:
-                    node = choices[0].get("message") or {}
-                candidate = node.get("content") if isinstance(node, dict) else None
-                content = candidate if isinstance(candidate, str) else json.dumps(node, ensure_ascii=False)
-            else:
-                content = str(parsed)
         except json.JSONDecodeError:
-            pass
-        if not translated:
-            match = re.search(r"\[.*\]", str(content), re.S)
-            translated = json.loads(match.group(0)) if match else []
-        if len(translated) != len(batch):
-            print(f"[mt] 警告：一批 {len(batch)} 条只返回 {len(translated)} 条，按序兜底", file=sys.stderr)
-            translated = (list(translated) + [""] * len(batch))[:len(batch)]
-        return [str(x).strip() for x in translated]
+            parsed = None
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], str):
+            return [x.strip() for x in parsed]
+        if isinstance(parsed, dict):
+            node = (parsed.get("choices") or [{}])[0].get("message", {}) if parsed.get("choices") else parsed
+            content = node.get("content") if isinstance(node, dict) else None
+            content = content if isinstance(content, str) else json.dumps(node, ensure_ascii=False)
+        elif isinstance(parsed, str):
+            content = parsed
+        else:
+            content = raw
+        if len(batch) == 1:                        # 单行：直接取正文，不必是 JSON
+            text = (content or "").strip()
+            if text.startswith("[") :
+                try:
+                    arr = json.loads(text, strict=False)
+                    return [str(arr[0]).strip()] if isinstance(arr, list) and arr else None
+                except json.JSONDecodeError:
+                    pass
+            return [text] if text else None
+        match = re.search(r"\[.*\]", content or "", re.S)
+        if not match:
+            return None
+        try:
+            arr = json.loads(match.group(0), strict=False)   # 模型常在字符串里漏转义换行
+        except json.JSONDecodeError:
+            return None
+        return [str(x).strip() for x in arr] if isinstance(arr, list) else None
     finally:
         os.unlink(msg_file)
 
 
-def translate(lines: list[str], key: str, chat_model: str, target: str,
-              workers: int = 8) -> list[str]:
-    """批量翻译；批间并行（网络等待为主），输出严格保持输入顺序。"""
-    from concurrent.futures import ThreadPoolExecutor
+def _translate_batch(batch: list[str], key: str, chat_model: str, system: str,
+                     timeout: int = TRANSLATE_TIMEOUT, backend: str = "cloud",
+                     local_server: str = LOCAL_SERVER_DEFAULT, depth: int = 0) -> list[str]:
+    """一批 → 译文列表，长度恒等于输入。
 
-    system = (
-        f"You are a professional subtitle translator. Translate each English subtitle line into "
-        f"natural, colloquial {target} (Simplified Chinese). Rules: translate line by line, keeping the "
-        f"SAME order and the SAME count as the input; never merge or split lines; keep ALL-CAPS speaker "
-        f"labels (e.g. 'GLENN STEARNS:') and put the Chinese translation after the label on the same line; "
-        f"keep bracketed sound descriptions such as [door slams] and (laughs) translated inside the same "
-        f"kind of brackets; keep ♪ music markers; use established Chinese renderings for people and place "
-        f"names and keep them consistent across lines; keep the style spoken and concise for on-screen "
-        f'subtitles; output ONLY a JSON array of strings, e.g. ["译文1","译文2"].'
-    )
-    batches = [lines[i:i + TRANSLATE_BATCH] for i in range(0, len(lines), TRANSLATE_BATCH)]
+    条数不符就二分（递归到单行），**绝不末尾补空**——补空等于把整批译文按错位映射出去。
+    """
+    if not batch:
+        return []
+    if _LIMITER is not None and backend != "local":
+        _LIMITER.wait()
+    out = (_translate_local(batch, local_server, timeout) if backend == "local"
+           else _ask_cloud(batch, key, chat_model, system, timeout))
+    if out is not None and len(out) == len(batch):
+        return out
+    if len(batch) == 1:
+        print(f"[mt] 单行仍失败：{batch[0][:40]!r}", file=sys.stderr)
+        return [out[0] if out else ""]
+    mid = len(batch) // 2
+    print(f"[mt] {len(batch)} 条只回 {len(out) if out else 0} 条 → 二分", file=sys.stderr)
+    return (_translate_batch(batch[:mid], key, chat_model, system, timeout, backend, local_server, depth + 1)
+            + _translate_batch(batch[mid:], key, chat_model, system, timeout, backend, local_server, depth + 1))
+
+
+def repair_missing(lines: list[str], translations: list[str], key: str, chat_model: str,
+                   target: str, timeout: int, backend: str, local_server: str,
+                   rounds: int = 2) -> list[str]:
+    """成批补译（每批 10 条，最多 rounds 轮），不逐行。"""
+    for rnd in range(1, rounds + 1):
+        bad = [i for i, t in enumerate(translations)
+               if not re.search(r"[\u4e00-\u9fff]", t or "") and re.search(r"[A-Za-z]", lines[i])]
+        if not bad:
+            return translations
+        print(f"[mt] 第 {rnd} 轮补译：{len(bad)} 条", flush=True)
+        for start in range(0, len(bad), 10):
+            idx = bad[start:start + 10]
+            fixed = _translate_batch([lines[i] for i in idx], key, chat_model, target,
+                                     timeout, backend, local_server)
+            for i, t in zip(idx, fixed):
+                if re.search(r"[\u4e00-\u9fff]", t or ""):
+                    translations[i] = t
+    return translations
+
+
+def translate(lines: list[str], key: str, chat_model: str, target: str,
+              workers: int = 4, batch_size: int = TRANSLATE_BATCH,
+              timeout: int = TRANSLATE_TIMEOUT, partial_path: Path | None = None,
+              fingerprint: str = "", backend: str = "cloud",
+              local_server: str = LOCAL_SERVER_DEFAULT, rpm: int = REQUESTS_PER_MIN) -> list[str]:
+    """批量翻译；批间并行，输出严格保持输入顺序。
+
+    增量缓存：每完成一批就把该批结果写进 partial_path（按指纹+批大小校验），
+    重跑时只补缺失批次——长片翻译中途失败不再从零开始。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    global _LIMITER
+    _LIMITER = _RateLimiter(rpm)
+
+    system = (f"You are a professional subtitle translator. Translate each English line into "
+              f"{target}. Keep the same order and count. Output ONLY a JSON array of strings.")
+    batches = [lines[i:i + batch_size] for i in range(0, len(lines), batch_size)]
     results: list[list[str] | None] = [None] * len(batches)
-    done = 0
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {pool.submit(_translate_batch, batch, key, chat_model, system): idx
-                   for idx, batch in enumerate(batches)}
-        for future in futures:
-            pass  # 保持 futures 存活；结果在下面按序收集
-        for future, idx in sorted(((f, i) for f, i in futures.items()), key=lambda x: x[1]):
-            results[idx] = future.result()
-            done += 1
-            print(f"[mt] {done}/{len(batches)} 批（{min(done * TRANSLATE_BATCH, len(lines))}/{len(lines)} 条）",
-                  flush=True)
-    flat: list[str] = []
-    for chunk in results:
-        flat.extend(chunk or [])
-    return flat[:len(lines)]
+    lock = threading.Lock()
+
+    def persist() -> None:
+        if partial_path is None:
+            return
+        payload = {"fingerprint": fingerprint, "batch_size": batch_size, "count": len(lines),
+                   "batches": {str(i): r for i, r in enumerate(results) if r is not None}}
+        partial_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    if partial_path is not None and partial_path.exists():
+        try:
+            cached = json.loads(partial_path.read_text(encoding="utf-8"))
+            if cached.get("fingerprint") == fingerprint and cached.get("batch_size") == batch_size:
+                for key_idx, value in (cached.get("batches") or {}).items():
+                    i = int(key_idx)
+                    if 0 <= i < len(batches) and isinstance(value, list) and len(value) == len(batches[i]):
+                        results[i] = value
+                reused = sum(1 for r in results if r is not None)
+                if reused:
+                    print(f"[mt] 续跑：复用已完成 {reused}/{len(batches)} 批", flush=True)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+    todo = [i for i, r in enumerate(results) if r is None]
+    done = len(batches) - len(todo)
+    if todo:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(_translate_batch, batches[i], key, chat_model, system, timeout,
+                                   backend, local_server): i for i in todo}
+            for future in as_completed(futures):
+                idx = futures[future]
+                results[idx] = future.result()
+                with lock:
+                    done += 1
+                    persist()
+                print(f"[mt] {done}/{len(batches)} 批（{min(done * batch_size, len(lines))}/{len(lines)} 条）",
+                      flush=True)
+
+    translations: list[str] = []
+    for r in results:
+        translations.extend(r or [])
+    return translations[:len(lines)]
 
 
 # ---------------- 3. 写 SRT ----------------
@@ -474,6 +604,10 @@ def write_srt(cues: list[dict], path: Path, translations: list[str] | None = Non
     print(f"[srt] {len(cues)} 条 → {path}", flush=True)
 
 
+T0 = time.time()
+T = {"probe": 0.0, "audio": 0.0, "asr": 0.0, "mt": 0.0, "write": 0.0}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="视频 → 双语字幕（复用优先：内嵌字幕 > 外挂字幕 > ASR）")
     ap.add_argument("video", type=Path)
@@ -487,6 +621,16 @@ def main() -> None:
     ap.add_argument("--api-key", default=None)
     ap.add_argument("--asr-json", type=Path, default=None, help="复用已有 ASR 结果（跳过解音轨与转写）")
     ap.add_argument("--no-translate", action="store_true", help="只出原文 SRT")
+    ap.add_argument("--no-cache", action="store_true", help="忽略译文缓存，强制重新翻译")
+    ap.add_argument("--batch", type=int, default=TRANSLATE_BATCH, help="每次翻译的条数（默认 20；实测 40 会大量触发二分反而更慢）")
+    ap.add_argument("--limit", type=int, default=0, help="只处理前 N 条字幕（小样验证用，0=全部）")
+    ap.add_argument("--workers", type=int, default=4, help="翻译并发数（默认 4；受 60 次/分钟限流约束）")
+    ap.add_argument("--rpm", type=int, default=REQUESTS_PER_MIN, help="每分钟最大请求数（默认 45，限流上限 60）")
+    ap.add_argument("--backend", choices=["cloud", "local"], default="cloud",
+                    help="翻译后端：cloud=bl text chat（默认 qwen-mt-flash）；local=本地 OpenAI 兼容服务")
+    ap.add_argument("--local-server", default=LOCAL_SERVER_DEFAULT,
+                    help="本地后端地址，如 llama-server --port 8080 或 mlx_lm.server")
+    ap.add_argument("--timeout", type=int, default=TRANSLATE_TIMEOUT, help="单次 bl 调用超时秒数（默认 180）")
     ap.add_argument("--keep-audio", action="store_true")
     args = ap.parse_args()
 
@@ -499,6 +643,7 @@ def main() -> None:
 
     cues: list[dict] | None = None
     origin = ""
+    _stage = time.time()
     if args.source in ("auto", "embedded"):
         tracks = embedded_tracks(video)
         text_tracks = [t for t in tracks if t["text_based"]]
@@ -538,9 +683,16 @@ def main() -> None:
                 transcribe(audio, asr_json, key, args.asr_model, args.source_lang)
                 if args.keep_audio:
                     shutil.copy2(audio, out_dir / audio.name)
+        T["audio"] = time.time() - _stage
+        _stage = time.time()
         cues = cues_from_asr(sentences_of(json.loads(asr_json.read_text(encoding="utf-8"))))
+        T["asr"] = time.time() - _stage
         origin = "ASR 转写"
 
+    T["probe"] = time.time() - _stage
+    if args.limit and args.limit > 0:
+        cues = cues[:args.limit]
+        print(f"[limit] 仅处理前 {len(cues)} 条", flush=True)
     if not cues:
         raise SystemExit("没有切出任何字幕条")
     print(f"[src] {origin}：{len(cues)} 条，{ts(cues[0]['begin'])} → {ts(cues[-1]['end'])}", flush=True)
@@ -555,9 +707,59 @@ def main() -> None:
         return
 
     key = api_key(args.api_key)
-    translations = translate([c["text"] for c in cues], key, args.chat_model, args.target_lang)
+    lines = [c["text"] for c in cues]
+    fingerprint = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
+    cache_path = out_dir / f"{stem}.{args.target_lang}.json"
+    translations: list[str] | None = None
+    if cache_path.exists() and not args.no_cache:
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("count") == len(lines) and cached.get("fingerprint") == fingerprint \
+                    and len(cached.get("translations") or []) == len(lines):
+                translations = [str(x) for x in cached["translations"]]
+                print(f"[mt] 复用译文缓存 {cache_path.name}（{len(translations)} 条）", flush=True)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            translations = None
+    _stage = time.time()
+    if translations is None:
+        translations = translate(lines, key, args.chat_model, args.target_lang,
+                                 workers=args.workers, batch_size=args.batch, timeout=args.timeout,
+                                 partial_path=cache_path, fingerprint=fingerprint,
+                                 backend=args.backend, local_server=args.local_server, rpm=args.rpm)
+        cache_path.write_text(json.dumps(
+            {"fingerprint": fingerprint, "count": len(lines), "model": args.chat_model,
+             "translations": translations}, ensure_ascii=False), encoding="utf-8")
+        print(f"[mt] 译文已缓存 → {cache_path.name}（重切/重跑不再重复付费）", flush=True)
+    # 补译校验：漏条/回原文的行成批补译（不逐行，避免 429 与慢）
+    if any(not re.search(r"[\u4e00-\u9fff]", t or "") for t in translations):
+        translations = repair_missing(lines, translations, key, args.chat_model, args.target_lang,
+                                      args.timeout, args.backend, args.local_server)
+        if cache_path is not None:
+            cache_path.write_text(json.dumps(
+                {"fingerprint": fingerprint, "count": len(lines), "model": args.chat_model,
+                 "translations": translations}, ensure_ascii=False), encoding="utf-8")
+    T["mt"] = time.time() - _stage
+    _stage = time.time()
     final = out_dir / f"{stem}.srt"
     write_srt(cues, final, translations, wrap_source=origin.startswith("ASR"))
+    T["write"] = time.time() - _stage
+
+    total = time.time() - T0
+    def _fmt(x: float) -> str:
+        return f"{x:.1f}"
+    print(f"【耗时】探测 {_fmt(T["probe"])}s · 抽音轨 {_fmt(T["audio"])}s · 转写 {_fmt(T["asr"])}s · "
+          f"翻译 {_fmt(T["mt"])}s · 写盘 {_fmt(T["write"])}s · 总计 {_fmt(total)}s"
+          f"（{len(cues)} 条，{origin}）", flush=True)
+    try:  # 与抖音分支共用一份时间日志，便于跨次比较
+        log = Path.home() / ".dsh/douyin-timing.log"
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write("\t".join([
+                time.strftime("%Y-%m-%d %H:%M:%S"), f"local:{stem[:40]}",
+                _fmt(T["probe"]), _fmt(T["audio"]), _fmt(T["asr"]), _fmt(T["mt"]),
+                _fmt(T["write"]), _fmt(total), str(len(cues)), str(sum(len(c["text"]) for c in cues)),
+            ]) + "\n")
+    except OSError as exc:
+        print(f"[timing] 写日志失败：{exc}", file=sys.stderr)
     print(f"[done] {final}")
 
 

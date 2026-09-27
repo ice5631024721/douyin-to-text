@@ -76,4 +76,49 @@ bl text chat --model qwen3.8-flash --messages-file /tmp/msg.json \
 
 - `--messages-file` 收 JSON messages 数组（`-` 可走 stdin）；系统提示要求"逐行翻译、顺序与条数同输入、只输出 JSON 数组"
 - **输出形态不固定**：实测直接返回模型正文的 JSON 数组（`["译文1","译文2"]`），也可能包成 `{choices:[{message:{content}}]}`——解析要三种都吃（见 `scripts/video_to_srt.py` 的 `translate()`）
-- 批大小 40 行为宜（实测 40 条/批比 20 条/批更划算）；模型用 `qwen3.8-flash`，`qwen3.8-max` 约慢一倍；返回条数与输入不符时脚本告警并逐行兜底，避免整批丢字幕
+- 批大小 40 行为宜（实测 40 条/批比 20 条/批更划算）；**务必带 `--timeout 180`**（默认超时偏短，并发下易 ETIMEDOUT）；模型用 `qwen3.8-flash`，`qwen3.8-max` 约慢一倍；返回条数与输入不符时脚本告警并逐行兜底，避免整批丢字幕
+
+## 模型选型与费用（2026-09-27 实测，价格取自百炼模型目录）
+
+### 纯文本翻译（字幕翻译用）
+
+| 模型 | 输入 | 输出 | 20 条实测 | 备注 |
+|---|---|---|---|---|
+| **qwen-mt-flash**（默认） | 0.7 元/百万 token | 1.95 | **2 s** | 与 turbo 同价同档，在售 |
+| qwen-mt-lite | 0.6 | 1.6 | 1 s | 输出会套 ```json 围栏、说话人标签保留英文 |
+| qwen-mt-plus | 1.8 | 5.4 | 2 s | 质量档 |
+| qwen-mt-uni | 文本 65 / 文档 20 / 图片 32 / 音频 400 元/百万 | 同左 | — | 多模态统一翻译 |
+| ~~qwen-mt-turbo~~ | 0.7 | 1.95 | 1 s | **2026-10-10 下线** |
+
+**一集 43.8 分钟剧集（765 条字幕）≈ 0.03 元**（输入约 1.2 万 token、输出约 1 万 token）。
+
+### 语音类
+
+| 模型 | 能力 | 价格 | 用法 |
+|---|---|---|---|
+| **qwen-audio-3.1-asr-flash-filetrans**（默认 ASR） | 识别，**带句级+词级时间戳** | 0.8 / 2.7 元/百万 token | 整片异步，实测 43.8 分钟音频 62 秒返回；一集 ≈0.08 元 |
+| qwen-audio-3.0-asr | 识别 | 0.00022 元/秒 | 无时间戳需求时更省 |
+| qwen3.8-omni-flash | 全模态理解＋**可直接英音→中文** | 0.8 / 2.7 元/百万 token | `bl omni --audio x.wav --text-only --message "翻译成中文"`；**无时间戳，不能做字幕轴** |
+| ~~gummy-chat-v1 / gummy-realtime-v1~~ | 语音识别及翻译 | 0.00015 元/秒 | **2026-10-10 下线** |
+| qwen3-livetranslate-flash 系列 | 直播/实时翻译 | 音频 10～40 元/百万 token | 实时/流式接口，`bl speech recognize` 调不通 |
+
+### 怎么查某个模型是否要下线
+
+```bash
+bl model list --model <model-id> --output json | python3 -c "import json,sys;m=(json.load(sys.stdin).get('items') or [{}])[0];print(m.get('upcomingOfflineAt') or '在售', m.get('announceUrl',''))"
+```
+目录里带 `--include-deprecated` 可看已下线模型。
+
+### 已知下线批次（2026-07-10 公告，2026-10-10 生效）
+
+`qwen-mt-turbo`、`gummy-chat-v1`、`gummy-realtime-v1` → 替代：文本用 **qwen-mt-flash**，语音直出用 **qwen3.8-omni-flash**。
+（公告页 https://www.aliyun.com/notice/118434 正文为 JS 渲染，清单以上面的目录字段为准。）
+
+### 本地翻译后端（离线/隐私场景，可选）
+
+```bash
+# llama.cpp（官方 GGUF 量化版，Apple Metal）
+llama-server -m ~/models/tencent/Hy-MT2-7B-GGUF/Hy-MT2-7B-Q4_K_M.gguf --port 8080 -ngl 99
+python scripts/video_to_srt.py <video> --backend local --local-server http://127.0.0.1:8080
+```
+本地用 Hy-MT2 官方的「分隔符」提示模板（`|||` 分段），脚本按分隔符切回。实测 Apple M4：Q4_K_M 19.95 tok/s、4.06 GB；MLX 8bit 12.0 tok/s、8.26 GB；质量与云端基本持平（中立裁判 6:6/6:7），但慢 8–25 倍。
