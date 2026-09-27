@@ -26,6 +26,13 @@ dy_txt_*.txt
 dy_img_*
 dy_transcript.txt
 
+# ---- 字幕 / 转写产物：可能含他人作品的受版权保护内容，绝不入库 ----
+*.srt
+*.vtt
+*.ass
+*.asr.json
+*.source.srt
+
 # ---- 评测运行产物（含完整 agent 会话轨迹与本地绝对路径）----
 evals/.skill-up-workspace/
 **/.skill-up-workspace/

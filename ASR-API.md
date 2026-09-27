@@ -6,8 +6,6 @@
 KEY=$(grep -E "^OPENAI_API_KEY=" ~/.agentmemory/.env | cut -d= -f2)
 ```
 
-> 本仓库不含任何密钥。KEY 从你机器上既有的 env 文件派生，请自行确认该文件权限（`chmod 600`）。
-
 ## 首选：bailian CLI（接受本地文件，实测路径）
 
 未装则先装：`export PATH="$HOME/.local/share/fnm/node-versions/v24.15.0/installation/bin:$PATH" && npm install -g bailian-cli`
@@ -53,3 +51,29 @@ curl -s -X POST https://dashscope.aliyuncs.com/compatible-mode/v1/audio/transcri
 - `bl speech recognize` **同步模式上限 300 秒音频**，超出报 `audio duration over service process (300s)`——长音频按 ≤280 秒/片切分，各片**并行**转写后按序拼接
 - **bl 输出流反直觉：转写正文在 stdout，`[Model:...]` banner 在 stderr**。收正文用 `2>/dev/null` 直接拿 stdout；`--output json` 在当前版本不可靠，按纯文本收
 - 本机 ffmpeg 断链（x264 dylib 缺失），音视频转换一律用 macOS 原生 `afconvert`
+
+## 整片带时间戳转写（字幕用，2026-09-27 实测）
+
+要时间轴就别走同步模式：**异步模型**（`*-filetrans` / `fun-asr` / `paraformer-*`）接受整片音频，并可用 `--out` 落 JSON。
+
+```bash
+bl speech recognize --url /tmp/e02_16k.flac \
+  --model qwen-audio-3.1-asr-flash-filetrans --language en \
+  --out /tmp/e02_asr.json --output json --api-key "$KEY"
+```
+
+- 实测：43.8 分钟音频（16 kHz 单声道 FLAC，48 MB）**62 秒**返回，**无 300 秒限制**
+- JSON 结构：`transcripts[0].sentences[]`，每句含 `begin_time`/`end_time`（毫秒）、`text`、`sentence_id`，以及**词级** `words[]`（`begin_time`/`end_time`/`text`/`punctuation`/`confidence`）——字幕切分与对齐用这一层
+- 覆盖率自检：末句 `end_time` 应接近容器时长（实测 2626.8s vs 2628s），并确认相邻句之间没有 >15s 的空隙
+- 解音轨用 PyAV：`~/.local/bin/uv run --with av --with numpy python scripts/video_to_srt.py …`；`afconvert` **读不了 MKV**（AVFoundation 不支持 Matroska）
+
+## 翻译：bl text chat（字幕双语化用）
+
+```bash
+bl text chat --model qwen3.8-flash --messages-file /tmp/msg.json \
+  --api-key "$KEY" --output json --quiet
+```
+
+- `--messages-file` 收 JSON messages 数组（`-` 可走 stdin）；系统提示要求"逐行翻译、顺序与条数同输入、只输出 JSON 数组"
+- **输出形态不固定**：实测直接返回模型正文的 JSON 数组（`["译文1","译文2"]`），也可能包成 `{choices:[{message:{content}}]}`——解析要三种都吃（见 `scripts/video_to_srt.py` 的 `translate()`）
+- 批大小 40 行为宜（实测 40 条/批比 20 条/批更划算）；模型用 `qwen3.8-flash`，`qwen3.8-max` 约慢一倍；返回条数与输入不符时脚本告警并逐行兜底，避免整批丢字幕
