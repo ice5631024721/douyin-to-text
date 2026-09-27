@@ -397,10 +397,12 @@ def _cloud_payload(batch: list[str], chat_model: str, system: str) -> list[dict]
                 {"role": "user", "content": json.dumps({"lines": batch}, ensure_ascii=False)}]
     if len(batch) == 1:
         return [{"role": "user", "content": "把下面这句英文翻译成简体中文，只输出译文：\n" + batch[0]}]
-    # 多行用 JSON 数组协议：一次 20 条约 2 s，是当前最省的往返方式
+    # 编号标记协议：模型偶尔把一句拆成两条（实测 20 条回 23/25 条），二分永远不收敛；
+    # 带 [[n]] 标记就能把拆出来的片段按标记归位，一次请求拿全，不用反复二分。
+    marked = "\n".join(f"[[{i + 1}]] {x}" for i, x in enumerate(batch))
     return [{"role": "user", "content":
-             "将下面的英文逐行翻译成简体中文，只输出 JSON 数组，条数与输入一致，不要额外解释：\n"
-             + json.dumps(batch, ensure_ascii=False)}]
+             "把下面每一行英文翻译成简体中文。必须原样保留每行开头的编号标记 [[n]]，"
+             "一个标记对应一条译文，不要合并或拆分编号：\n" + marked}]
 
 
 def _ask_cloud(batch: list[str], key: str, chat_model: str, system: str,
@@ -453,6 +455,20 @@ def _ask_cloud(batch: list[str], key: str, chat_model: str, system: str,
                 except json.JSONDecodeError:
                     pass
             return [text] if text else None
+        # 编号标记协议解析：文本按 [[n]] 切片，同编号的片段合并（模型拆句时仍能归位）
+        marked_text = content or ""
+        found = list(re.finditer(r"\[\[\s*(\d+)\s*\]\]", marked_text))
+        if found and len(batch) > 1:
+            slots: dict[int, list[str]] = {}
+            for pos, m in enumerate(found):
+                n = int(m.group(1))
+                end = found[pos + 1].start() if pos + 1 < len(found) else len(marked_text)
+                piece = marked_text[m.end():end].strip()
+                if piece:
+                    slots.setdefault(n, []).append(piece)
+            if all(i + 1 in slots for i in range(len(batch))):
+                return [" ".join(slots[i + 1]).strip() for i in range(len(batch))]
+            return None
         match = re.search(r"\[.*\]", content or "", re.S)
         if not match:
             return None
