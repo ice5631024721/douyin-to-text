@@ -304,9 +304,25 @@ def main() -> int:
         ("ar", "مرحبا"), ("th", "สวัสดี"), ("zh", "你好"), ("en", "Hello"))),
           "漏译判据覆盖非中英目标（旧版只认 zh/en → ja/ko 目标每条都判漏译、白烧两轮）",
           "非中英目标的漏译判据仍不成立")
-    check(not m.looks_like_lang("你好世界", "en") and not m.looks_like_lang("안녕", "en"),
-          "漏译判据：中文/韩文不算英文译文（拉丁目标要排除其它文字区）",
-          "其它文字区被当成了英文")
+    check(not m.looks_like_lang("Hello 世界", "en")
+          and not m.looks_like_lang("hello 안녕하세요", "en")
+          and not m.looks_like_lang("Hello Привет", "en"),
+          "漏译判据：混入其它文字区的文本不算英文译文"
+          "（旧断言用的串不含拉丁字母，走的是恒真路径——等于假绿）",
+          "混入其它文字区的文本被当成了英文")
+    check(all(m.looks_like_lang(t, lg) for lg, t in (
+        ("ta", "தமிழ் மொழி"), ("km", "ភាសាខ្មែរ"), ("my", "မြန်မာဘာသာ"),
+        ("bn", "বাংলা ভাষা"), ("si", "සිංහල"), ("bo", "བོད་ཡིག"))),
+          "漏译判据覆盖长尾文字区（泰米尔/高棉/缅甸/孟加拉/僧伽罗/藏文）"
+          "——没有它们时每条译文都被判漏译，白跑两轮且真漏译修不好",
+          "长尾文字区的漏译判据不成立")
+    check(m.detect_lang(["Bonjour, comment allez-vous ?"])[0] == "",
+          "短样本（<30 词）的法文也不再被当成英文（靠非英语信号词兜底）",
+          f"短法文样本仍被判成英文：{m.detect_lang(['Bonjour, comment allez-vous ?'])!r}")
+    check(not m.NON_EN_MARKERS.search("I think that you should go to the store") and
+          m.detect_lang(["Hello, how are you today my friend?"]) == ("en", True),
+          "短样本兜底不误伤真英文（信号词只收不与英语撞车的词）",
+          "真英文短样本被误判")
     check(m.parse_langs("en,zh-TW") == ("en", "zh-Hant") and m.lang_name("zh-TW") == "繁體中文",
           "繁体中文不再被静默并成简体（zh-TW / zh-Hant → zh-Hant / 繁體中文）",
           f"繁体被并成简体：{m.parse_langs('en,zh-TW')!r}")
@@ -323,6 +339,31 @@ def main() -> int:
               f"ja 目标误判，发起 {len(calls)} 次补译")
     finally:
         m._translate_batch = real_batch
+
+    # ---- 6. 外挂字幕判定：自家成品不得被读回来，标记不得误伤真外挂 ----
+    # 复审抓到的 N1：精确同名路径只查了 looks_bilingual（靠"含大量汉字"），
+    # 于是语言对不含中文时（--subtitles en,ko）会把**自己刚交付的 .ass** 当外挂原文读回来，
+    # 重跑变成自我翻译。与历史上 .source.srt 劫持同类，只是换了入口。
+    print("== 6. 外挂字幕判定（自家成品 vs 真外挂）==")
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        video = d / "sample.mkv"
+        video.write_bytes(b"\x00")          # 只需同名占位：判定只看文件名与同级目录
+        own = d / "sample.ass"
+        m.write_ass([{"begin": 0, "end": 1000, "text": "x"}], own, [["Hello", "你好"]])
+        check(m.has_own_mark(own) is True, "自家成品的产出标记可被识别", "成品标记识别失败")
+        check(m.sidecar_path(video) is None,
+              "自家成品不被当成外挂字幕（旧版在精确同名路径漏了这道守卫）",
+              f"自家成品被当作外挂字幕：{m.sidecar_path(video)}")
+        own.unlink()
+        side = d / "sample.srt"
+        side.write_text("1\n00:00:00,000 --> 00:00:01,000\nthis tool is named omnisub\n",
+                        encoding="utf-8")
+        check(m.has_own_mark(side) is False,
+              "产出标记只对 ASS 生效（SRT 不可能带我们的标记）", "SRT 被误判为自家产物")
+        check(m.sidecar_path(video) == side,
+              "真外挂字幕即使台词里出现 omnisub 也被正常采纳（标记按整行匹配，不搜子串）",
+              f"真外挂被误判成自家产物：{m.sidecar_path(video)}")
 
     print()
     print(f"结果：{PASS} 通过 / {FAIL} 失败")

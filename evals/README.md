@@ -55,7 +55,7 @@ agent 级用例有个天然弱点：**被测路径可以被 agent 绕过去**。
 
 ```bash
 bash evals/fixtures/scripts/selftest-omnisub.sh      # 端到端契约，20 项
-python3 evals/fixtures/scripts/selftest-langs.py     # 语言方向与 ASS 样式，35 项
+python3 evals/fixtures/scripts/selftest-langs.py     # 语言方向与 ASS 样式，62 项
 ```
 
 **`selftest-omnisub.sh`（20 项，约 15 秒）**：① `--refresh-source --asr-json` 必须让成品来自
@@ -65,15 +65,15 @@ ASR JSON；② 同目录重跑、只给 `--asr-json`，显式参数仍要说了�
 不覆盖它（改写 `.mono.ass`）；⑦ 调用 `selftest-langs.py`。
 
 **双证（同一命令、同一夹具，只换被测脚本）**：新版 `20 通过 / 0 失败`（exit 0）；
-HEAD 版 `10 通过 / 10 失败`（exit 1——产物名还是 `.srt`、且缺语言接口）。
+修复前版本（`git show HEAD~1:scripts/video_to_srt.py`）`10 通过 / 10 失败`（exit 1——产物名还是 `.srt`、且缺语言接口）。
 
-**`selftest-langs.py`（35 项，零网络）为什么必须单独存在**：这一版最严重的缺陷
+**`selftest-langs.py`（62 项，零网络）为什么必须单独存在**：这一版最严重的缺陷
 （把翻译方向写死在提示词里、`--target-lang` 根本不进请求）**端到端是看不出来的**——
 退出码 0、日志正常、耗时正常，只是产出变成"中文原样重复两遍"的假双语。要拦住它只能直接查请求体：
 该闸门断言 `_cloud_payload` 的提示词文本（en→zh **逐字节**与旧版一致 + zh→en 方向正确）、
 漏译判据的方向性（正证：合格英译零补译请求；反证：中文回给 en 必须被抓）、以及 ASS 的样式字段
-（字号/配色/字重/描边/转义/多语言行回落）。**双证**：新版 `35 通过 / 0 失败`（exit 0）；
-HEAD 版 exit 1（`_cloud_payload() takes 3 positional arguments but 5 were given`，闸门把它翻译成人话再报）。
+（字号/配色/字重/描边/转义/多语言行回落）。**双证**：新版 `62 通过 / 0 失败`（exit 0）；
+修复前版本 exit 1（`_cloud_payload() takes 3 positional arguments but 5 were given`，闸门把它翻译成人话再报）。
 这条是回归门禁的首选，skill-up 那 6 条用来验 agent 层的契约。
 
 ## 跑法

@@ -128,6 +128,10 @@ LANG_NAMES = {
     "de": "德文", "es": "西班牙文", "ru": "俄文", "pt": "葡萄牙文", "it": "意大利文",
     "ar": "阿拉伯文", "th": "泰文", "vi": "越南文", "id": "印尼文", "tr": "土耳其文",
     "hi": "印地文", "nl": "荷兰文", "pl": "波兰文", "sv": "瑞典文", "ms": "马来文",
+    "ta": "泰米尔文", "te": "泰卢固文", "kn": "卡纳达文", "ml": "马拉雅拉姆文",
+    "bn": "孟加拉文", "gu": "古吉拉特文", "pa": "旁遮普文", "or": "奥里亚文",
+    "si": "僧伽罗文", "my": "缅甸文", "km": "高棉文", "lo": "老挝文",
+    "ka": "格鲁吉亚文", "hy": "亚美尼亚文", "am": "阿姆哈拉文", "bo": "藏文", "mn": "蒙古文",
 }
 # ffprobe 的 ISO639-2/B、bl 的 ISO639-1、带地区码的标签都要能认
 LANG_ALIASES = {
@@ -155,11 +159,37 @@ SCRIPT_LANGS = {
     "he": re.compile(r"[\u0590-\u05ff]"),                                 # 希伯来
     "el": re.compile(r"[\u0370-\u03ff\u1f00-\u1fff]"),                  # 希腊
     "th": re.compile(r"[\u0e00-\u0e7f]"),                                 # 泰文
-    "hi": re.compile(r"[\u0900-\u097f]"),                                 # 天城文
-    "zh": re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]"),                  # 汉字
+    "hi": re.compile(r"[\u0900-\u097f]"),                                 # 天城文（印地/尼泊尔）
+    "bn": re.compile(r"[\u0980-\u09ff]"),                                 # 孟加拉
+    "pa": re.compile(r"[\u0a00-\u0a7f]"),                                 # 古尔穆奇（旁遮普）
+    "gu": re.compile(r"[\u0a80-\u0aff]"),                                 # 古吉拉特
+    "or": re.compile(r"[\u0b00-\u0b7f]"),                                 # 奥里亚
+    "ta": re.compile(r"[\u0b80-\u0bff]"),                                 # 泰米尔
+    "te": re.compile(r"[\u0c00-\u0c7f]"),                                 # 泰卢固
+    "kn": re.compile(r"[\u0c80-\u0cff]"),                                 # 卡纳达
+    "ml": re.compile(r"[\u0d00-\u0d7f]"),                                 # 马拉雅拉姆
+    "si": re.compile(r"[\u0d80-\u0dff]"),                                 # 僧伽罗
+    "lo": re.compile(r"[\u0e80-\u0eff]"),                                 # 老挝
+    "bo": re.compile(r"[\u0f00-\u0fff]"),                                 # 藏文
+    "my": re.compile(r"[\u1000-\u109f]"),                                 # 缅甸
+    "ka": re.compile(r"[\u10a0-\u10ff]"),                                 # 格鲁吉亚
+    "hy": re.compile(r"[\u0530-\u058f]"),                                 # 亚美尼亚
+    "am": re.compile(r"[\u1200-\u137f]"),                                 # 阿姆哈拉（埃塞俄比亚）
+    "km": re.compile(r"[\u1780-\u17ff]"),                                 # 高棉
+    "mn": re.compile(r"[\u1800-\u18af]"),                                 # 蒙古
+    "zh": re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]"),                  # 汉字（放最后：日文含汉字）
 }
 # 拉丁字母语言共用字母区：区块分不出英/法/德/西，只能用英文虚词密度筛一轮（见 detect_lang）
 LATIN_LANGS = {"en", "fr", "de", "es", "pt", "it", "nl", "pl", "sv", "tr", "vi", "id", "ms"}
+# 明显不属于英语的高频虚词：用来兜住"样本太短、虚词密度判不出来"的拉丁字母文本。
+# 只收**不会与英语撞车**的词（die/am/man/per/con 这类双语词一律不收）。
+NON_EN_MARKERS = re.compile(
+    r"\b(?:le|les|des|une|vous|nous|est|pas|pour|dans|avec|qui|comment|merci|bonjour|"
+    r"der|und|ist|nicht|ich|wir|auch|mit|für|eine|das|"
+    r"los|las|una|para|como|pero|muy|"
+    r"della|sono|gli|het|een|niet|dat|voor|zijn|"
+    r"não|mas|muito|bir|ve|için|ama|của|và|là|không|"
+    r"yang|dan|tidak|untuk|dengan)\b", re.I)
 EN_STOPWORDS = re.compile(
     r"\b(?:the|and|you|your|that|this|it|is|are|was|were|be|to|of|in|on|at|for|with|from|"
     r"have|has|had|do|does|did|not|but|they|them|we|us|he|she|his|her|our|their|there|here|"
@@ -248,14 +278,13 @@ def detect_lang(texts: list[str]) -> tuple[str, bool]:
     sample = " ".join(t for t in texts if t)[:4000]
     if not sample:
         return "", False
-    for code in ("ko", "ja", "ru", "ar", "he", "el", "th", "hi"):
-        if SCRIPT_LANGS[code].search(sample):
+    for code, pattern in SCRIPT_LANGS.items():
+        if pattern.search(sample):
             return code, True
-    if SCRIPT_LANGS["zh"].search(sample):
-        return "zh", True
     words = re.findall(r"[A-Za-z][A-Za-z']*", sample)
     if len(words) < 30:
-        return "en", True
+        # 样本太短，密度判不出来：先排除"看得出不是英文"的，再按英文放行（少花一次翻译钱）
+        return ("", False) if NON_EN_MARKERS.search(sample) else ("en", True)
     density = len(EN_STOPWORDS.findall(sample)) / len(words)
     return ("en", True) if density >= 0.12 else ("", False)
 
@@ -400,6 +429,24 @@ def embedded_tracks(video: Path) -> list[dict]:
     return tracks
 
 
+def pick_embedded_track(pool: list[dict], prefer_lang: str | None) -> dict:
+    """按 --source-lang 挑轨：先比完整标签，再退到**主语言**比。
+
+    轨标签常是 ISO639-2（chi/zho/eng），用户写的是 zh/en；而 --source-lang zh-TW 归一后是
+    `zh-Hant`，若只比完整标签就一条都匹配不上，会静默退回第一条轨（实测退回英文轨）。
+    """
+    if not pool:
+        raise SystemExit("视频里没有可用字幕轨")
+    want = normalize_lang(prefer_lang)
+    if not want:
+        return pool[0]
+    exact = next((t for t in pool if normalize_lang(t["lang"]) == want), None)
+    if exact is not None:
+        return exact
+    base = want.split("-")[0]
+    return next((t for t in pool if normalize_lang(t["lang"]).split("-")[0] == base), None) or pool[0]
+
+
 def extract_embedded(video: Path, index: int | None, prefer_lang: str | None) -> tuple[list[dict], dict]:
     tracks = embedded_tracks(video)
     if not tracks:
@@ -411,11 +458,7 @@ def extract_embedded(video: Path, index: int | None, prefer_lang: str | None) ->
             raise SystemExit(f"没有 idx={index} 的字幕轨")
     else:
         pool = [t for t in tracks if t["text_based"]] or tracks
-        want = normalize_lang(prefer_lang)
-        if want:
-            # 两边都归一：轨标签常是 ISO639-2（chi/zho/eng），而用户写的是 zh/en
-            track = next((t for t in pool if normalize_lang(t["lang"]) == want), None)
-        track = track or pool[0]
+        track = pick_embedded_track(pool, prefer_lang)
     if not track["text_based"]:
         raise SystemExit(f"字幕轨 idx={track['index']} 是图形字幕（{track['codec']}），需要先 OCR")
     with tempfile.TemporaryDirectory(prefix="omnisub-sub-") as tmp:
@@ -453,12 +496,20 @@ def has_own_mark(path: Path) -> bool:
 
     成品名就是 <视频基名>，与"用户放的外挂字幕"同名同扩展名，靠文件名分不出来，
     所以在 ASS 头部写产出标记（Title/注释行）当指纹。只读头 2KB，避免整片读盘。
+
+    两道收紧：① 只认 ASS/SSA —— 我们只出 ASS，SRT/VTT 不可能带我们的标记；
+    ② 按**整行**匹配那两个标记行，而不是搜子串 —— 否则真外挂字幕的台词里出现 "omnisub"
+    就会被判成"自家产物"跳过，回落 ASR 白花钱且日志误导。
     """
+    if path.suffix.lower() not in (".ass", ".ssa"):
+        return False
     try:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
-            return ASS_MARK in fh.read(2048)
+            head = fh.read(2048)
     except OSError:
         return False
+    marks = {f"; Generated by {ASS_MARK}", f"Title: {ASS_MARK}"}
+    return any(line.strip() in marks for line in head.splitlines()[:40])
 
 
 def _is_own_artifact(cand: Path, video: Path) -> bool:
@@ -482,6 +533,12 @@ def sidecar_path(video: Path) -> Path | None:
     for ext in SIDECAR_EXTS:
         exact = video.with_suffix(ext)
         if exact.exists():
+            # 精确同名是最先命中的路径，必须是**两道**守卫：产出标记 + 双语外观。
+            # 只查 looks_bilingual（靠"含大量汉字"）时，语言对不含中文（如 en,ko）的成品
+            # 会被当外挂字幕读回来 —— 与历史上 .source.srt 劫持同一类漏洞，只是换了入口。
+            if _is_own_artifact(exact, video):
+                print(f"[src] 跳过 {exact.name}：本技能自己产出的成品/中间产物（不是外挂原文）", flush=True)
+                continue
             if looks_bilingual(exact):
                 print(f"[src] 跳过 {exact.name}：它看起来是双语成品（不是原文）", flush=True)
                 continue
@@ -605,7 +662,9 @@ def transcribe(audio: Path, out_json: Path, key: str, model: str, lang: str) -> 
     `--language` 在 bl 里是**语言提示**而非必填项；给的提示错了反而会伤识别率，
     所以 auto 时宁可不给，让用户按需显式指定。
     """
-    hint = "" if (lang or "").strip().lower() in ("", "auto") else normalize_lang(lang)
+    # bl 的 --language 只传**主语言码**：示例与实测都是 zh/en/ja 这种两字母码，
+    # zh-Hant 之类的变体没验过，传它属于拿付费接口做实验。
+    hint = "" if (lang or "").strip().lower() in ("", "auto") else normalize_lang(lang).split("-")[0]
     argv = ["speech", "recognize", "--url", str(audio), "--model", model,
             "--out", str(out_json), "--output", "json",
             "--api-key", key, "--timeout", str(ASR_TIMEOUT)]
