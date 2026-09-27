@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """视频 → 任意语言对的双语 ASS 字幕，时间轴与视频一一对应。
 
-任意源语言 → 任意语言对（默认 en,zh = 英上中下）：语言对里排第一的那行在最上，
-用醒目的 Upper 样式（更大、加粗、纯白），其余行用 Lower（稍小、暖白）。
-源语言若在语言对里，该行直接复用原文，不翻译、不花钱。
+任意源语言 → 任意语言对（默认 en,zh）：**译文在上、原文沉底**——中文片出英上中下、
+英文片出中上英下（用户截图参照）。在上的那行用醒目的 Upper 样式（6.5% 画面高、加粗、纯白），
+在下的用 Lower（4.0%、常规、暖白）。源语言若在语言对里，该行直接复用原文，不翻译、不花钱。
 
 复用优先（不重复造轮子）：能拿到现成字幕就不转写——
   1. 内嵌字幕轨（MKV/MP4 的 srt/ass 文本轨，含 SDH）→ ffprobe 探轨 + ffmpeg 抽取，零 ASR 成本
@@ -120,7 +120,8 @@ TRANSLATE_ATTEMPTS = 3    # 单批最多重试次数（失败后二分）
 ASR_TIMEOUT = 600
 
 # ---------------- 语言：任意源语言 → 任意语言对的双语字幕 ----------------
-# 交付契约：--subtitles 给的语言对**按顺序**决定行序，第一行在上、用醒目样式（见 ASS_STYLES）。
+# 交付契约：**译文在上（醒目）、原文沉底**（display_order()）；--subtitles 的顺序决定译文行之间的
+# 次序，源不在语言对里时即整体行序。中文片→英上中下、英文片→中上英下（用户截图参照）。
 # 源语言若出现在语言对里，该行直接用原文（不翻译、不花钱）；不在则整对都翻译。
 LANGS_DEFAULT = ("en", "zh")
 LANG_NAMES = {
@@ -1206,14 +1207,15 @@ def write_source_srt(cues: list[dict], path: Path) -> None:
 # 支持参差不齐，不能当交付标准。要"上面的字幕更醒目"就只能出 ASS。
 ASS_MARK = "omnisub"                # 产出标记：把自己产出的成品从"外挂字幕"候选里排除
 ASS_FONT_DEFAULT = "PingFang SC"    # 中文首选；缺字体时 libass 按系统默认回落
-# 「上面的字幕更醒目」的落地（方案 A 高对比白系）：
-#   Upper = 第一行（在上）：纯白 #FFFFFF、字号更大、加粗、描边更粗 → 醒目
-#   Lower = 其余行（在下）：暖白 #F0EDE6（BGR 即 E6EDF0）、字号略小、常规字重 → 退到背景
-# 语言对里谁在上由 --subtitles 的顺序决定，样式只认"位置"，不认具体语言。
+# 「上面的字幕更醒目」的落地（方案 A 高对比白系，2026-09-28 按用户截图参照收紧）：
+#   Upper = 译文行（在上）：纯白 #FFFFFF、6.5% 画面高、加粗、描边更粗 → 醒目
+#   Lower = 原文行（在下）：暖白 #F0EDE6（BGR 即 E6EDF0）、4.0% 画面高、常规字重 → 退到背景
+# 截图参照的两行字号比约 1.6:1；旧版 5.0/4.35（1.15:1）被用户判为"不明显"。
+# 谁在上由 display_order() 决定（译文在上、原文沉底），样式只认"位置"，不认具体语言。
 # (样式名, 主色 &HAABBGGRR, 字号/画面高, 粗体开关, 描边/画面高)
 ASS_STYLES = (
-    ("Upper", "&H00FFFFFF", 0.0500, -1, 0.0028),
-    ("Lower", "&H00E6EDF0", 0.0435, 0, 0.0022),
+    ("Upper", "&H00FFFFFF", 0.0650, -1, 0.0032),
+    ("Lower", "&H00E6EDF0", 0.0400, 0, 0.0020),
 )
 
 
@@ -1243,7 +1245,8 @@ def write_ass(cues: list[dict], path: Path, lines_by_cue: list[list[str]],
     为什么不用"每行一个事件 + 各自 MarginV"：那要手算两行的行高差，字号或分辨率一变就错位，
     而本项目的字号是按画面高度比例算的，换片就得重算。单事件方案里两行天然是一个整体，
     居中堆叠与底部定位全交给 libass，换字号/换分辨率都不会散。
-    行序 = lines_by_cue 里的顺序：第一条在最上、用 Upper 样式，其余用 Lower。
+    行序 = lines_by_cue 里的顺序（由 display_order() 给出：译文在上、原文沉底）：
+    第一条在最上、用 Upper 样式，其余用 Lower。
     """
     w = max(320, int(width or 1920))
     h = max(240, int(height or 1080))
@@ -1376,6 +1379,18 @@ def resolve_source_lang(explicit: str, track_lang: str, texts: list[str]) -> tup
     return code, f"文本启发式自动判定 → {code}（要更准可显式传 --source-lang）"
 
 
+def display_order(pair: tuple[str, ...], src_lang: str) -> list[str]:
+    """行序：译文按语言对顺序在上，**原文沉底**。
+
+    为什么不是"语言对顺序即行序"：两份用户参照互相矛盾——中文片要"英上中下"、
+    英文片要"中上英下"（截图参照：上行大而粗的译文、下行小而淡的原文）。
+    统一两者的不变量是**译文在上且醒目、原文在下**：源=zh → 英上中下；源=en → 中上英下；
+    源不在语言对里（ja 源、或源语言没判出来）→ 全是译文，按语言对顺序。
+    """
+    rest = [lg for lg in pair if lg != src_lang]
+    return rest + ([src_lang] if src_lang in pair else [])
+
+
 def video_size(video: Path) -> tuple[int, int]:
     """画面尺寸 → ASS 的 PlayResX/Y（字号与描边都按它换算）。取不到就退回 1920x1080。"""
     try:
@@ -1464,8 +1479,9 @@ def main() -> None:
                          "也可显式给 en/zh/ja/ko/fr…。非中英源语言建议显式指定，"
                          "ASR 语言提示与翻译方向提示词都会更准")
     ap.add_argument("--subtitles", default=None, metavar="LANG[,LANG...]",
-                    help="要产出的字幕语言与行序（逗号分隔），**第一行在最上、用醒目样式**；"
-                         "默认 en,zh（英上中下）。源语言若在列表中则该行直接复用原文、不翻译。"
+                    help="要产出的字幕语言（逗号分隔），默认 en,zh。行序不变量：**译文在上（醒目）、"
+                         "原文沉底**（中文片→英上中下、英文片→中上英下）；顺序只决定译文行之间的次序。"
+                         "源语言若在列表中则该行直接复用原文、不翻译。"
                          "支持任意语言对与三行以上，如 ja,en,zh")
     ap.add_argument("--target-lang", default=None,
                     help="[已废弃] 单目标写法，等价于 --subtitles <源语言>,<目标语言>；请改用 --subtitles")
@@ -1634,8 +1650,9 @@ def main() -> None:
             print(f"[lang] --target-lang 已废弃 → 按 --subtitles {','.join(pair)} 处理", flush=True)
         else:
             pair = LANGS_DEFAULT
-    print(f"[lang] 源语言 {src_lang or '未知'}（{src_basis}）→ 输出 {','.join(pair)}"
-          f"（{len(pair)} 行，第一行在最上、用醒目样式）", flush=True)
+    order = display_order(pair, src_lang)      # 行序唯一事实源：日志与写盘共用
+    print(f"[lang] 源语言 {src_lang or '未知'}（{src_basis}）→ 输出 {','.join(order)}"
+          f"（{len(order)} 行：译文在上、原文沉底，第一行用醒目样式）", flush=True)
     w, h = video_size(video)
 
     if args.no_translate:
@@ -1673,7 +1690,7 @@ def main() -> None:
 
     _stage = time.time()
     final = out_dir / f"{stem}.ass"
-    rows_by_cue = [[rows_by_lang[lang][i] for lang in pair] for i in range(len(cues))]
+    rows_by_cue = [[rows_by_lang[lang][i] for lang in order] for i in range(len(cues))]
     write_ass(cues, final, rows_by_cue, width=w, height=h)
     T["write"] = time.time() - _stage
 

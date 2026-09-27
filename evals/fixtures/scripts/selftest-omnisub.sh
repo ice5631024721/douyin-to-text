@@ -118,8 +118,9 @@ grep -q "源语言 zh" <<<"$out" && ok "场景 5：中文转写被判定为 zh �
 grep -q "输出 en,zh" <<<"$out" && ok "场景 5：默认语言对是 en,zh（英上中下）" \
   || bad "场景 5：默认语言对不是 en,zh —— $(grep -o '\[lang\].*' <<<"$out" | head -1)"
 out=$(cd "$d" && $PY "$SCRIPT" sample.mkv --asr-json cn.json --no-translate --no-log --cache-dir .cache --subtitles zh,ja 2>&1)
-grep -q "输出 zh,ja" <<<"$out" && ok "场景 5：--subtitles zh,ja 覆盖默认语言对与行序" \
-  || bad "场景 5：--subtitles 没生效 —— $(grep -o '\[lang\].*' <<<"$out" | head -1)"
+# 中文源 + 语言对 zh,ja：zh 是原文 → 沉底；ja 是译文 → 在上。行序不变量的直接断言。
+grep -q "输出 ja,zh" <<<"$out" && ok "场景 5：--subtitles zh,ja 生效，且原文(zh)沉底、译文(ja)在上" \
+  || bad "场景 5：--subtitles/行序不变量没生效 —— $(grep -o '\[lang\].*' <<<"$out" | head -1)"
 out=$(cd "$d" && $PY "$SCRIPT" sample.mkv --asr-json cn.json --no-translate --no-log --cache-dir .cache --subtitles en,en 2>&1)
 grep -q "重复语言" <<<"$out" && ok "场景 5：--subtitles 里的重复语言被拒绝" \
   || bad "场景 5：重复语言没被拒绝"

@@ -202,8 +202,9 @@ def main() -> int:
         check(up[F_FONT] == "PingFang SC" and low[F_FONT] == "PingFang SC",
               "字体名已写入（缺字体时 libass 按系统默认回落）",
               f"字体名不对：{up[F_FONT] if up else '?'}")
-        check(up[F_SIZE] == "54" and low[F_SIZE] == "47",
-              "字号按画面高缩放：Upper 54 / Lower 47（1080p）",
+        check(up[F_SIZE] == "70" and low[F_SIZE] == "43",
+              "字号按画面高缩放且对比够大：Upper 70 / Lower 43（1080p，比值 1.63）"
+              "——旧版 54/47（1.15）被用户判为不够醒目",
               f"字号不对：{up[F_SIZE]}/{low[F_SIZE]}")
         check(up[F_PRIMARY] == "&H00FFFFFF" and low[F_PRIMARY] == "&H00E6EDF0",
               "上行纯白 &H00FFFFFF、下行暖白 &H00E6EDF0（方案 A）",
@@ -223,8 +224,8 @@ def main() -> int:
         m.write_ass(cues, big, rows, width=3840, height=2160)
         big_styles = style_fields(big.read_text(encoding="utf-8"))
         b_up, b_low = big_styles["Upper"], big_styles["Lower"]
-        check(b_up[F_SIZE] == "108" and b_low[F_SIZE] == "94" and b_up[F_OUTLINE] == "6",
-              "2160p 下字号/描边按画面高自动缩放（108/94、描边 6）",
+        check(b_up[F_SIZE] == "140" and b_low[F_SIZE] == "86" and b_up[F_OUTLINE] == "7",
+              "2160p 下字号/描边按画面高自动缩放（140/86、描边 7）",
               f"2160p 缩放不对：{b_up[F_SIZE]}/{b_low[F_SIZE]}/{b_up[F_OUTLINE]}")
 
         # 三行（--subtitles ja,en,zh）：第三行回落到 Lower 样式
@@ -234,6 +235,17 @@ def main() -> int:
         check("{\\rUpper}A\\N{\\rLower}B\\N{\\rLower}C" in tri,
               "三行语言对：首行 Upper、其余 Lower（支持 N 行）",
               "多行样式回落不对")
+
+    # ---- 4b. 行序不变量：译文在上、原文沉底 ----
+    check(m.display_order(("en", "zh"), "zh") == ["en", "zh"],
+          "源=zh 时英上中下（与既有交付一致）", "中文源行序变了")
+    check(m.display_order(("en", "zh"), "en") == ["zh", "en"],
+          "源=en 时中上英下（截图参照：译文在上、原文沉底）", "英文源行序没翻")
+    check(m.display_order(("en", "zh"), "ja") == ["en", "zh"]
+          and m.display_order(("en", "zh"), "") == ["en", "zh"],
+          "源不在语言对里（含未判定）时按语言对顺序、全是译文", "第三方源行序不对")
+    check(m.display_order(("ja", "en", "zh"), "ja") == ["en", "zh", "ja"],
+          "三行语言对且源在其中：两条译文在上、原文沉底", "三行沉底不对")
 
     # ---- 4. 语言解析与源语言回退 ----
     print("== 4. 语言解析与源语言回退 ==")
