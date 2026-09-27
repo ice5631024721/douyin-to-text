@@ -102,16 +102,19 @@ python ~/.dsh/skills/douyin-to-text/scripts/video_to_srt.py "<视频>" \
 
 **小样验证**：改 prompt/协议时别拿整片试——`--limit 120` 只翻前 120 条，20 秒出结果；确认后再跑全片（译文有缓存，重复跑不重付）。
 
-### 装进 selfvideo
+### 交付：只出字幕文件，**不要往播放器里装**
 
-selfvideo 用 mpv 垫底、没关 `config`（`~/.config/mpv/` 为空），mpv 默认 `sub-auto=exact`：**SRT 命名成与视频同名、放同目录即自动加载**。
+**默认只做一件事**：把 `<视频基名>.srt` 写到视频同目录（脚本 `--out` 默认就是视频目录）。同名同目录是**跨平台通行**的自动加载约定，**不要**去写任何播放器的私有缓存/库目录——播放器不止一种，替用户选播放器是越界（2026-09-27 被明确要求回退：曾把成品拷进 selfvideo 缓存，已删）。
 
-```bash
-cp "<视频基名>.srt" "<视频所在目录>/<视频基名>.srt"                          # mpv 自动加载
-cp "<视频基名>.srt" ~/Library/Caches/dev.selfvideo.player/selfvideo/subs/     # 应用字幕缓存
-```
+| 场景 | 命名 / 位置 | 说明 |
+|---|---|---|
+| 通用播放器（mpv / IINA / VLC / MPC-HC / PotPlayer / Infuse） | 与视频**同名同目录** `<视频基名>.srt` | 脚本默认产出，零配置自动加载 |
+| 媒体库（Plex / Jellyfin / Emby） | 同目录 + **语言后缀**：`<视频基名>.zh.srt`；双语用 `.zh-en.srt` | 扫描后作为外挂字幕轨。语言后缀要紧贴基名（别写成 `.zh .srt`）；只放 `<基名>.srt` 时可能被标成"未知语言" |
+| 手动加载 | 任意路径 | 播放器 `--sub-file=`、拖入窗口、或字幕菜单选文件 |
 
-（selfvideo 字幕链路：provider → `~/Library/Caches/dev.selfvideo.player/selfvideo/subs/` → mpv `sub-add`，见 `src-tauri/src/subs/mod.rs` 的 `sub_load`。）
+- 跨平台性来自文件本身：**UTF-8 无 BOM、LF 换行**的 SRT，主流播放器与媒体服务器通用。
+- 用户**点名**要装进某个播放器时，才按那个播放器的文档装（路径随时会变，不要写死在技能里）。
+- 需要给媒体库用的语言后缀版时，让用户自己 `cp`（或按上面表格命名），**本技能不主动制造第二份**。
 
 ### 翻译后端选型（2026-09-27 实测，Apple M4/32GB，20 条真实字幕）
 
@@ -132,6 +135,12 @@ cp "<视频基名>.srt" ~/Library/Caches/dev.selfvideo.player/selfvideo/subs/   
 - **`bl text chat --output json` 可能直接输出模型正文（JSON 数组）**；`qwen-mt-*` 系列**不接受 system 角色**（报 `Role must be in [user, assistant]`）——脚本对三种返回形态都做了兼容。
 - **`bl text chat` 默认超时偏短**：并发下会 `ETIMEDOUT`，必须 `--timeout 180`；单批失败重试 3 次，仍失败二分（末尾补空会让整批译错位）。
 - **模型下线**：`qwen-mt-turbo`、`gummy-chat-v1`、`gummy-realtime-v1` 于 **2026-10-10** 下线（目录字段 `upcomingOfflineAt`，公告 [aliyun.com/notice/118434](https://www.aliyun.com/notice/118434)）；替代见 `ASR-API.md`。
+- **ASR 的 `words[]` 两个方向都不可靠，字幕文本必须取句级 `text`**（2026-09-27 实测 E08 全片 823 句）：标点**不在** `words[].text` 里而单独放 `punctuation`（实测 1323 个），只拼 text 会产出"整片 631/631 条零标点"的字幕；词本身还会**拆开**（`gl`+`enn`、`pr`+`ou`+`der`、`9`+`0`、`er`+`ie`，须无空格相接）或**缺前导空格**（`in`+`90`、`restaurant`+`You`、`And`+`I`，须有空格）——本地规则分不出这两种（直接 join 得 28 条 `in90`，只补空格得更多 `gl enn`）。现在 `_split_long` 把词对齐到句级 text 的"字母数字投影"，**显示文本一律取自 text、words 只供时间**；对齐失败才退回按字符比例切。标点一并恢复了"按小句断句"的能力——旧版丢标点后断句判断永不触发，长句按 84 字硬切出半句（`…i couldn`、`dollar business in`），半句各自送 MT 就被脑补出原文没有的意思。**标点的上限就是句级 text 给的上限**：ASR 本身没打标点的句子（实测 684 条里 46 条）无从补；`words[].punctuation` 不参与显示文本。
+- **自家产物会被当成"外挂字幕"读回来，且能架空显式参数**（两层，2026-09-27 各踩一次）：① `<基名>.source.srt`（纯英文）能绕过 `looks_bilingual` 守卫，被 sidecar 兜底 glob `<基名>*` 命中；② 上一次 `--no-translate` 留下的**单语** `<基名>.srt` 同样会被当成外挂字幕。两者的后果一样：`--asr-json`/`--refresh-source` 被静默架空、重跑仍出旧文本。修法两层：`sidecar_path()` 用 `_is_own_artifact()` 排除 `.source`/`.mono`；**`--asr-json` 直接强制 `--source asr`**（显式指定转写结果时，缓存、内嵌轨、外挂字幕一律让位）。判据：跑完先看日志 `[src]` 那行写的是什么来源，别只看退出码 0。
+- **单条字幕曾让自检崩**：`check_timeline` 的 `max(gaps)` 在只有 1 条 cue 时抛 `ValueError: max() iterable argument is empty`（实测：短夹具只有一句台词就必崩，试跑 agent 靠自己打补丁绕过）。已改成空列表安全取值。
+- **`--no-log`**：评测/CI 跑时加上，不追加 `~/.dsh/douyin-timing.log`（默认会追加，属宿主状态污染）。
+- **平台支持只承诺实测过的**：macOS 是验证过的路径（含整集 44 分钟 MKV）；Linux 走同一 ffmpeg/ffprobe 链路但未实测；Windows 的工具发现（PATH 优先 + `bl.cmd` 经 `cmd /c` + `os.pathsep`）已按约定写好，**本机无 Windows，未实测**。任何平台排查的第一步都是确认 `ffprobe`/`bl` **能被直接执行**，而不是只 `which` 得到。
+- **`[mt] N 条只回 0 条 → 二分` 的真相是"标记不全"**：那是模型把短句并进相邻行、少回一个 `[[n]]`（实测约 1/4 的批，二分后全部补齐，成品零漏译），不是请求失败。日志现在直接写明缺几个标记。
 - macOS 无 `timeout`；整片转写/翻译放后台作业跑。
 
 ## 计时

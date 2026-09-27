@@ -1,0 +1,46 @@
+id: video-embedded-subtitle-reuse
+title: 本地视频分支 —— 有内嵌字幕轨必须复用（零 ASR），且只交付文件不装播放器
+description: |
+  验证「本地视频文件 → 双语字幕」分支的复用优先级与交付边界：
+  视频自带英文 srt 轨时走 embedded 抽取而不是 ASR；产出按「同名同目录」落盘；
+  不得往播放器私有目录拷贝（播放器不止一种，替用户选播放器越界）。
+
+input:
+  prompt: |
+    工作区里有一段 4 秒的测试视频 sample.mkv（内嵌英文字幕轨）。
+    douyin-to-text 这个 Skill 已装在工作区：.dsh-skills/douyin-to-text/
+    （脚本在 .dsh-skills/douyin-to-text/scripts/video_to_srt.py）。
+
+    请按该 Skill 的「本地视频文件 → 双语字幕」分支处理它，但**只出原文、不要翻译**
+    （加 --no-translate），并且不要写时间日志（加 --no-log）。
+    不要联网，不要调用任何 ASR 或翻译接口。
+    按 Skill 约定，字幕文件与视频同名同目录（工作区根目录）。
+
+    只生成字幕文件，**不要往任何播放器目录里拷贝**。
+
+    完成后只输出下面三行，不要多余解释：
+    OUT=<生成的 .source.srt 在工作区里的相对路径>
+    FIRST=<该文件第一条字幕的英文原文>
+    SOURCE=<实际使用的字幕来源，embedded / sidecar / asr 三选一>
+
+context:
+  repo_fixture: evals/fixtures/repos/video-embedded
+
+expect:
+  must_contain:
+    - "SUB_FIXTURE_ALPHA the quick brown fox."
+    - "SOURCE=embedded"
+  must_not_contain:
+    - "dev.selfvideo.player"
+  files_exist:
+    - "sample.source.srt"
+  file_contains:
+    - path: "sample.source.srt"
+      content: "SUB_FIXTURE_BETA jumps over the lazy dog."
+
+judge:
+  type: rule_based
+  success:
+    - output_contains:
+        all: ["SUB_FIXTURE_ALPHA the quick brown fox.", "SOURCE=embedded"]
+        not: ["dev.selfvideo.player"]

@@ -1,9 +1,9 @@
 schema_version: v1alpha1
 
 # douyin-to-text 的评测套件（skill-upper 生成）。
-# 设计取舍：三条用例全部【不联网、不下载、不写日志】，只验 Skill 的契约面——
-# 路由判断、解析规则、守卫条件、输出模板。真实抓取链路由人工冒烟覆盖，
-# 不放进 CI 门禁（Douyin 风控 + cookie 时效 + ASR 计费都会让它变成 flaky case）。
+# 设计取舍：五条用例全部【不联网、不下载、不写宿主日志】，只验 Skill 的契约面——
+# 路由判断、解析规则、守卫条件、输出模板，以及本地视频字幕分支的复用优先级与显式参数权威性。
+# 真实抓取链路由人工冒烟覆盖，不放进 CI 门禁（Douyin 风控 + cookie 时效 + ASR 计费会让它变 flaky）。
 
 environment:
   type: none
@@ -56,9 +56,11 @@ cases:
     - evals/cases/triage-video-share-page.yaml
     - evals/cases/cookie-invalid-guard.yaml
     - evals/cases/summary-output-format.yaml
+    - evals/cases/video-embedded-subtitle-reuse.yaml
+    - evals/cases/video-source-artifact-guard.yaml
   defaults:
     timeout_seconds: 300
-    max_turns: 6
+    max_turns: 8
   parallelism: 1
 
 judge:

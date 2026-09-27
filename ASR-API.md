@@ -63,7 +63,7 @@ bl speech recognize --url /tmp/e02_16k.flac \
 ```
 
 - 实测：43.8 分钟音频（16 kHz 单声道 FLAC，48 MB）**62 秒**返回，**无 300 秒限制**
-- JSON 结构：`transcripts[0].sentences[]`，每句含 `begin_time`/`end_time`（毫秒）、`text`、`sentence_id`，以及**词级** `words[]`（`begin_time`/`end_time`/`text`/`punctuation`/`confidence`）——字幕切分与对齐用这一层
+- JSON 结构：`transcripts[0].sentences[]`，每句含 `begin_time`/`end_time`（毫秒）、`text`、`sentence_id`，以及**词级** `words[]`（`begin_time`/`end_time`/`text`/`punctuation`/`confidence`）——**字幕文本取句级 `text`，`words[]` 只用来定时间**：标点单独在 `punctuation` 里，词还会被拆开（`gl`+`enn`）或缺前导空格（`in`+`90`），拼词当文本必错（实测见 SKILL.md 的坑）
 - 覆盖率自检：末句 `end_time` 应接近容器时长（实测 2626.8s vs 2628s），并确认相邻句之间没有 >15s 的空隙
 - 解音轨/抽字幕用 `ffmpeg`：`~/.local/bin/python3 scripts/video_to_srt.py …`（`ffprobe` 探轨、`ffmpeg -map 0:<idx> -c:s srt` 抽字幕、`-vn -ac 1 -ar 16000 -c:a flac` 抽音轨）
 

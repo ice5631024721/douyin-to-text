@@ -8,8 +8,9 @@
 再翻译：默认云端 bl text chat（qwen-mt-flash），--backend local 可切本地 llama.cpp / mlx-lm
 的 OpenAI 兼容服务；输出「原文行 + 译文行」的双语 SRT。
 
-工具链（全部本机已装）：ffmpeg / ffprobe（/opt/homebrew/bin，2026-09-27 用 brew 修好）、
-bailian CLI（bl，ASR 与云端翻译）、可选 llama-server（本地翻译）。
+工具链：ffmpeg / ffprobe（**走 PATH 优先，再按平台兜底**：macOS 常见 /opt/homebrew、Linux /usr/bin、
+Windows C:\ffmpeg\bin）、bailian CLI（bl，ASR 与云端翻译；Windows 上是 bl.cmd，过 cmd /c 执行）、
+可选 llama-server（本地翻译）。
 注意：qwen-mt-turbo 与 gummy-* 于 2026-10-10 下线，默认翻译模型取 qwen-mt-flash。
 
 跑法：
@@ -17,9 +18,12 @@ bailian CLI（bl，ASR 与云端翻译）、可选 llama-server（本地翻译�
       [--source-lang en] [--target-lang zh] [--sub-index N] [--asr-model ...]
       [--chat-model qwen-mt-flash] [--backend cloud|local] [--local-server URL]
       [--asr-json <已有.json>] [--no-translate] [--batch 20] [--workers 4]
-      [--refresh-source] [--verify-sync auto|on|off] [--limit N]
+      [--refresh-source] [--verify-sync auto|on|off] [--limit N] [--no-log]
 
-产出：<out>/<视频基名>.srt（双语）、.source.srt（复用的原文）、.<lang>.json（译文缓存，重切不重付）
+产出：**只有文件，不往任何播放器里装**——
+  <out>/<视频基名>.srt（双语）、.source.srt（复用的原文）、.<lang>.json（译文缓存，重切不重付）
+与视频同名同目录即被 mpv / IINA / VLC / MPC-HC / PotPlayer / Infuse 自动加载；
+Plex / Jellyfin / Emby 需要语言后缀（<基名>.zh.srt 或 .zh-en.srt），由用户自行命名。
 """
 
 from __future__ import annotations
@@ -38,8 +42,38 @@ import urllib.request
 import time
 from pathlib import Path
 
-FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
-FFPROBE = shutil.which("ffprobe") or "/opt/homebrew/bin/ffprobe"
+def _tool_candidates(name: str) -> list[str]:
+    """按平台给出可执行文件的兜底路径（先看 PATH，找不到才看这里）。"""
+    home = Path.home()
+    out: list[str] = []
+    if sys.platform == "darwin":
+        out += [f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}"]
+    elif os.name == "nt":
+        out += [rf"C:\ffmpeg\bin\{name}.exe", rf"C:\Program Files\ffmpeg\bin\{name}.exe"]
+    else:
+        out += [f"/usr/bin/{name}", f"/usr/local/bin/{name}", f"/snap/bin/{name}"]
+    out += [str(home / ".local/bin" / name), str(home / "bin" / name)]
+    return out
+
+
+def find_tool(name: str, aliases: tuple[str, ...] = ()) -> str:
+    """定位外部可执行文件：**优先 PATH**（macOS/Linux/Windows 通用），再按平台兜底。
+
+    aliases 用于 Windows 的 shim 后缀（npm 装出来的是 `bl.cmd` 而不是 `bl`）。
+    都没有就原样返回名字，让子进程抛出"找不到命令"，比在这里编一个假路径清楚。
+    """
+    for candidate in (name, *aliases):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    for cand in _tool_candidates(name):
+        if Path(cand).exists():
+            return cand
+    return name
+
+
+FFMPEG = find_tool("ffmpeg")
+FFPROBE = find_tool("ffprobe")
 ASR_MODEL_DEFAULT = "qwen-audio-3.1-asr-flash-filetrans"
 # 实测（2026-09-27，765 条字幕）：flash 与 max 译文质量相当，flash 快约一倍
 # qwen-mt-turbo 与 gummy-* 于 2026-10-10 下线；qwen-mt-flash 同价同档且在售（见 ASR-API.md）
@@ -53,7 +87,12 @@ SIDECAR_EXTS = (".srt", ".ass", ".ssa", ".vtt")
 MAX_LINE_CHARS = 42          # 仅 ASR 路线需要重切时用
 MAX_CUE_MS = 7000
 MIN_CUE_MS = 800
+# 与下一句紧贴时优先让位给下一句；让不出 MIN_READABLE_MS 就退回 MIN_CUE_MS
+# （宁可 0.5s 极短重叠，也不出 0.2s 闪现——实测 E08 全片 684 条里只触发 1 次）
+MIN_READABLE_MS = 400
 MIN_GAP_MS = 40
+SOURCE_SUFFIX = ".source"     # 原文缓存：<基名>.source.srt / .source.json（自家中间产物）
+MONO_SUFFIX = ".mono"         # 只出原文时的单语产物：<基名>.mono.srt
 REQUESTS_PER_MIN = 50   # qwen-mt-flash 限额：60 次/分钟 + 3.5 万 token/分钟；留安全余量
 TRANSLATE_BATCH = 20   # 实测 40 条/批会频繁触发"模型合并短句→条数不符→二分"，20 条最稳最快
 TRANSLATE_TIMEOUT = 180   # bl --timeout：实测 8 并发下偶发 ETIMEDOUT，给足时间
@@ -62,33 +101,62 @@ ASR_TIMEOUT = 600
 
 
 def find_bl() -> str:
-    found = shutil.which("bl")
-    if found:
-        return found
-    candidates = [Path.home() / ".local/bin/bl", Path("/opt/homebrew/bin/bl"), Path("/usr/local/bin/bl")]
-    fnm_root = Path.home() / ".local/share/fnm/node-versions"
-    if fnm_root.exists():
-        candidates += sorted(fnm_root.glob("*/installation/bin/bl"))
+    """定位 bailian CLI（跨平台，复用 find_tool 的"PATH 优先 + 平台兜底"）。
+
+    Windows 上 npm -g 装出来的是 `bl.cmd`：CreateProcess 不能直接执行 .cmd，
+    必须过 `cmd /c`（见 `_bl_argv`）。
+    """
+    exe = find_tool("bl", ("bl.cmd", "bl.bat", "bl.exe"))
+    if exe != "bl":
+        return exe
+    home = Path.home()
+    appdata = os.environ.get("APPDATA")
+    node_roots = [home / ".local/share/fnm/node-versions"]
+    candidates: list[Path] = []
+    if os.name == "nt" and appdata:
+        candidates += [Path(appdata) / "npm" / "bl.cmd", Path(appdata) / "npm" / "bl"]
+        node_roots.append(Path(appdata) / "fnm" / "node-versions")
+    candidates.append(home / ".local/bin/bl")
+    for root in node_roots:
+        if root.exists():
+            candidates += sorted(root.glob("*/installation/bin/bl"))
     for cand in candidates:
         if Path(cand).exists():
             return str(cand)
     raise SystemExit("找不到 bl（bailian-cli）：npm install -g bailian-cli（见 ASR-API.md）")
 
 
+def _bl_argv(exe: str) -> list[str]:
+    """Windows 的 .cmd/.bat shim 要先过 cmd /c，POSIX 下原样返回。"""
+    if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/c", exe]
+    return [exe]
+
+
 def tool_env() -> dict:
-    """给子进程用的 PATH：前置 ffmpeg/uv/node/bl 所在目录。
+    """给子进程用的 PATH：前置 ffmpeg/bl 所在目录与常见全局 bin。
 
     DSH 里 bash 子进程的 PATH 可能只有 /usr/bin:/bin:/usr/sbin:/sbin，
     而 ffsubsync 这类工具内部是按名字调 `ffmpeg` 的 —— 不前置就会静默失败。
+    跨平台三点：分隔符用 os.pathsep（Windows 是 `;`）、Windows 补 %APPDATA%\\npm、
+    目录**一律从工具实际所在位置推导**（不按版本号排序猜 fnm 目录：本机装过
+    v24.13.0/v24.15.0/v26.7.0，挑"最新"会把 bl 的 `#!/usr/bin/env node` 换成另一个
+    node 运行时；bl 所在目录同时也放着配套的 node，跟它走才对）。
     """
     env = os.environ.copy()
-    parts = [str(Path(FFMPEG).parent), str(Path.home() / ".local/bin"),
-             str(Path.home() / ".local/share/fnm/node-versions/v24.15.0/installation/bin")]
+    parts: list[str] = []
+    ffmpeg_dir = os.path.dirname(FFMPEG)
+    if ffmpeg_dir:
+        parts.append(ffmpeg_dir)
+    parts.append(str(Path.home() / ".local/bin"))
+    appdata = os.environ.get("APPDATA")
+    if os.name == "nt" and appdata:
+        parts.append(str(Path(appdata) / "npm"))
     try:
-        parts.append(str(Path(find_bl()).parent))
+        parts.append(str(Path(find_bl()).parent))     # bl 与配套 node 同目录
     except SystemExit:
         pass
-    env["PATH"] = ":".join(parts + [env.get("PATH", "")])
+    env["PATH"] = os.pathsep.join(parts + [env.get("PATH", "")])
     return env
 
 
@@ -203,6 +271,18 @@ def looks_bilingual(path: Path) -> bool:
     return zh / len(cues) > 0.3
 
 
+def _is_own_artifact(cand: Path, video: Path) -> bool:
+    """`<基名>.source.srt` / `<基名>.mono.srt` 是本技能自己写出的中间产物，不是"别人的外挂字幕"。
+
+    它们就落在视频目录里，且是纯英文 → 能绕过 looks_bilingual 守卫，被 sidecar 兜底 glob
+    （`<基名>*`）当成外挂字幕读回来。后果实测：修好切分器后重跑，--refresh-source 与
+    --asr-json 全被架空，成品仍是旧的无标点文本 —— 必须显式排除。
+    """
+    if cand.suffix.lower() not in SIDECAR_EXTS:
+        return False
+    return cand.stem in (f"{video.stem}{SOURCE_SUFFIX}", f"{video.stem}{MONO_SUFFIX}")
+
+
 def sidecar_path(video: Path) -> Path | None:
     for ext in SIDECAR_EXTS:
         exact = video.with_suffix(ext)
@@ -214,6 +294,9 @@ def sidecar_path(video: Path) -> Path | None:
     stem = video.stem
     for cand in sorted(video.parent.glob(f"{stem}*")):
         if cand.suffix.lower() in SIDECAR_EXTS and cand != video:
+            if _is_own_artifact(cand, video):
+                print(f"[src] 跳过 {cand.name}：本技能自己的中间产物（原文缓存），不是外挂字幕", flush=True)
+                continue
             if looks_bilingual(cand):        # 兜底路径同样要防"吃自己的产出"
                 print(f"[src] 跳过 {cand.name}：它看起来是双语成品（不是原文）", flush=True)
                 continue
@@ -324,9 +407,9 @@ def extract_audio(video: Path, audio: Path) -> float:
 def transcribe(audio: Path, out_json: Path, key: str, model: str, lang: str) -> dict:
     print(f"[asr] {model} ← {audio.name}", flush=True)
     proc = subprocess.run(
-        [find_bl(), "speech", "recognize", "--url", str(audio), "--model", model,
-         "--language", lang, "--out", str(out_json), "--output", "json",
-         "--api-key", key, "--timeout", str(ASR_TIMEOUT)],
+        _bl_argv(find_bl()) + ["speech", "recognize", "--url", str(audio), "--model", model,
+                               "--language", lang, "--out", str(out_json), "--output", "json",
+                               "--api-key", key, "--timeout", str(ASR_TIMEOUT)],
         capture_output=True, text=True, env=bl_env(),
     )
     if proc.returncode != 0 or not out_json.exists():
@@ -347,40 +430,164 @@ def sentences_of(data: dict) -> list[dict]:
     return out
 
 
-def _split_long(sent: dict, max_ms: int, max_chars: int) -> list[dict]:
-    words = [w for w in sent["words"] if (w.get("text") or "").strip()]
-    if not words:
-        text = sent["text"]
-        if len(text) <= max_chars and sent["end"] - sent["begin"] <= max_ms:
-            return [sent]
-        chunks, cur = [], ""
-        for piece in re.split(r"(?<=[,;:.!?])\s+", text):
-            if cur and len(cur) + 1 + len(piece) > max_chars:
-                chunks.append(cur); cur = piece
-            else:
-                cur = f"{cur} {piece}".strip()
-        if cur:
-            chunks.append(cur)
-        total = max(1, len(chunks))
-        span = max(1, sent["end"] - sent["begin"])
-        return [{"begin": sent["begin"] + span * i // total, "end": sent["begin"] + span * (i + 1) // total,
-                 "text": c, "words": []} for i, c in enumerate(chunks)]
+def _canonical_text(text: str) -> str:
+    """句级 text 才是可靠文本（标点、空格、词形都对），压缩空白后返回。"""
+    return re.sub(r"\s+", " ", (text or "").strip())
 
-    pieces, cur = [], []
+
+def _align_words(words: list[dict], canonical: str) -> list[list[int]] | None:
+    """把词对齐到句级文本，返回 [[begin_ms, end_ms, c0, c1], ...]，c0/c1 是 canonical 的字符区间。
+
+    为什么要对齐（E08 实测，旧版两个坑都踩了）：ASR 的 words[] 两个方向都不可靠——
+      拆词（须无空格相接）："gl"+"enn"、"pr"+"ou"+"der"、"9"+"0"、"er"+"ie"
+      缺空格（须有空格）  ："in"+"90"、"restaurant"+"You"、"day"+"90"、"And"+"I"
+    本地规则分不出这两种（旧版直接 join → "in90" 共 28 条；只补空格 → "gl enn" 更多）。
+    只有句级 text 知道空格在哪：**显示文本一律取自 canonical**，words[] 只贡献时间戳——
+    在 canonical 的"字母数字投影"上顺序匹配每个词，上面两种怪癖都能自然对齐。
+    任一词匹配不上、区间不单调、或覆盖不足 90% 时返回 None（调用方退回比例切分）。
+    """
+    if not canonical or not words:
+        return None
+    proj = [(i, ch.lower()) for i, ch in enumerate(canonical) if ch.isalnum()]
+    if not proj:
+        return None
+    out: list[list[int]] = []
+    cursor = 0
     for word in words:
-        cur.append(word)
-        joined = "".join((w.get("text") or "") for w in cur).strip()
-        ends_clause = bool(re.search(r"[,;:.!?]$", joined))
-        too_long = len(joined) > max_chars or (word["end_time"] - cur[0]["begin_time"]) > max_ms
-        if too_long or (ends_clause and len(joined) > max_chars * 0.6):
-            pieces.append(cur); cur = []
-    if cur:
-        pieces.append(cur)
-    out = []
-    for group in pieces:
-        text = "".join((w.get("text") or "") for w in group).strip()
-        out.append({"begin": int(group[0]["begin_time"]), "end": int(group[-1]["end_time"]), "text": text})
+        token = [ch.lower() for ch in (word.get("text") or "") if ch.isalnum()]
+        if not token:                        # 纯标点词（"'" / ","）→ 并进前一个词的区间
+            if out:
+                end = out[-1][3]
+                while end < len(canonical) and not canonical[end].isalnum() and canonical[end] != " ":
+                    end += 1
+                out[-1][3] = end
+            continue
+        idx, hit, first = cursor, 0, None
+        while idx < len(proj) and hit < len(token):
+            if proj[idx][1] == token[hit]:
+                if first is None:
+                    first = proj[idx][0]
+                hit += 1
+            idx += 1
+        if hit < len(token) or first is None or (out and first < out[-1][3]):
+            return None
+        out.append([int(word.get("begin_time") or 0), int(word.get("end_time") or 0),
+                    first, proj[idx - 1][0] + 1])
+        cursor = idx
+    if not out:
+        return None
+    seen = bytearray(len(canonical))
+    for span in out:
+        for i in range(max(0, span[2]), min(len(canonical), span[3])):
+            seen[i] = 1
+    if sum(seen[i] for i, _ in proj) < 0.9 * len(proj):
+        return None
     return out
+
+
+def _text_windows(text: str, max_chars: int) -> list[tuple[int, int]]:
+    """把整句切成 ≤max_chars 的字符窗口：先按标点小句打包，超长小句再按空格均衡硬切。
+
+    旧版按字符数贪心硬切，句尾常剩 1–3 个词的孤儿条（"out."、"that out."），
+    碎片单独送 MT 会被脑补成别的意思；按小句打包后切点基本落在标点上。
+    """
+    atoms: list[tuple[int, int]] = []
+    for m in re.finditer(r"[^,;:.!?…]*[,;:.!?…]+|[^,;:.!?…]+$", text):
+        seg = m.group()
+        lead = len(seg) - len(seg.lstrip())
+        trail = len(seg) - len(seg.rstrip())
+        if m.end() - trail > m.start() + lead:
+            atoms.append((m.start() + lead, m.end() - trail))
+    if not atoms:
+        atoms = [(0, len(text))]
+
+    packed: list[tuple[int, int]] = []
+    cur0 = cur1 = -1
+    for a0, a1 in atoms:
+        if cur0 < 0:
+            cur0, cur1 = a0, a1
+        elif a1 - cur0 <= max_chars:
+            cur1 = a1
+        else:
+            packed.append((cur0, cur1)); cur0, cur1 = a0, a1
+    if cur0 >= 0:
+        packed.append((cur0, cur1))
+
+    out: list[tuple[int, int]] = []
+    for c0, c1 in packed:
+        seg = text[c0:c1]
+        if len(seg) <= max_chars:
+            out.append((c0, c1))
+            continue
+        n = (len(seg) + max_chars - 1) // max_chars      # 单个小句仍超长 → 均衡硬切
+        start = 0
+        for i in range(1, n):
+            ideal = len(seg) * i // n
+            lo, hi = start + 1, len(seg) - 1
+            # 在整个小句里找离 ideal 最近的空格（不在 ideal 附近截断，否则会切进词里）
+            cuts = [p for p in range(lo, hi + 1) if seg[p] == " "]
+            cut = min(cuts, key=lambda p: (abs(p - ideal), p)) if cuts else min(max(ideal, lo), hi)
+            out.append((c0 + start, c0 + cut)); start = cut
+        out.append((c0 + start, c1))
+    return [(a, b) for a, b in out if text[a:b].strip()]
+
+
+def _split_long(sent: dict, max_ms: int, max_chars: int) -> list[dict]:
+    """把一条 ASR 句切成若干条字幕：文本取自句级 text，时间来自对齐后的词。
+
+    长度预算（max_chars，≈两行）与时长预算（max_ms）双约束；切点优先落在标点上。
+    """
+    words = [w for w in sent["words"]
+             if (w.get("text") or "").strip() or (w.get("punctuation") or "").strip()]
+    canonical = _canonical_text(sent.get("text"))
+    if not canonical:
+        return []
+    span_ms = max(1, sent["end"] - sent["begin"])
+    spans = _align_words(words, canonical)
+    if spans is None:
+        # 回退：词层缺失或对不上 → 只按文本切，时间在句内按**字符数比例**摊
+        # （旧版按条数均摊且不看时长预算，慢语速/长停顿会切出 20 s 的长条）
+        n_time = max(1, (span_ms + max_ms - 1) // max_ms)
+        eff = max(20, len(canonical) // n_time)
+        chunks = [(canonical[a:b].strip(), b - a)
+                  for a, b in _text_windows(canonical, min(max_chars, eff))]
+        chunks = [(t, w) for t, w in chunks if t]
+        if not chunks:
+            return []
+        total_chars = sum(w for _, w in chunks) or 1
+        out, acc = [], 0
+        for text, width in chunks:
+            begin = sent["begin"] + span_ms * acc // total_chars
+            acc += width
+            out.append({"begin": begin, "end": sent["begin"] + span_ms * acc // total_chars,
+                        "text": text, "words": []})
+        return out
+
+    pieces: list[dict] = []
+    for c0, c1 in _text_windows(canonical, max_chars):
+        inner = [s for s in spans if s[2] < c1 and s[3] > c0]
+        if not inner:
+            continue
+        begin, end = inner[0][0], inner[-1][1]
+        if end - begin <= max_ms:                    # 时长也在预算内 → 一条
+            pieces.append({"begin": begin, "end": end, "text": canonical[c0:c1].strip()})
+            continue
+        # 慢语速/长停顿：窗口时长超标 → 用词再按时长均分
+        groups: list[list[list[int]]] = [[inner[0]]]
+        for span in inner[1:]:
+            # 切点必须落在"空格之后"的词首：ASR 会把 don't 拆成 don/'/t，
+            # 允许在 t 处切就会得到 "I don'" ‖ "t know what to say."
+            at_word_start = span[2] == 0 or canonical[span[2] - 1] == " "
+            if span[1] - groups[-1][0][0] > max_ms and at_word_start:
+                groups.append([span])
+            else:
+                groups[-1].append(span)
+        bounds = [c0] + [g[0][2] for g in groups[1:]] + [c1]
+        for i, group in enumerate(groups):
+            text = canonical[bounds[i]:bounds[i + 1]].strip()
+            if text:
+                pieces.append({"begin": group[0][0], "end": group[-1][1], "text": text})
+    return pieces
 
 
 def cues_from_asr(sentences: list[dict]) -> list[dict]:
@@ -424,7 +631,11 @@ def normalize_cues(cues: list[dict]) -> list[dict]:
             cue["end"] = cue["begin"] + MIN_CUE_MS
         nxt = clean[i + 1] if i + 1 < len(clean) else None
         if nxt and cue["end"] > nxt["begin"] - MIN_GAP_MS:
-            cue["end"] = max(cue["begin"] + MIN_CUE_MS, nxt["begin"] - MIN_GAP_MS)
+            cap = nxt["begin"] - MIN_GAP_MS
+            # 优先不重叠：只要还留得住 MIN_READABLE_MS 的可读时长，就压到下一句开始之前。
+            # 旧版写 max(begin+MIN_CUE_MS, cap)，下一句紧贴时会反推出 120–360ms 重叠
+            #（E08 实测 3 处：条 46/340/510）。
+            cue["end"] = cap if cap >= cue["begin"] + MIN_READABLE_MS else cue["begin"] + MIN_CUE_MS
     return clean
 
 
@@ -496,8 +707,9 @@ def _ask_cloud(batch: list[str], key: str, chat_model: str, system: str,
         raw = ""
         for attempt in range(1, TRANSLATE_ATTEMPTS + 1):
             proc = subprocess.run(
-                [find_bl(), "text", "chat", "--model", chat_model, "--messages-file", msg_file,
-                 "--api-key", key, "--output", "json", "--quiet", "--timeout", str(timeout)],
+                _bl_argv(find_bl()) + ["text", "chat", "--model", chat_model,
+                                       "--messages-file", msg_file, "--api-key", key,
+                                       "--output", "json", "--quiet", "--timeout", str(timeout)],
                 capture_output=True, text=True, env=bl_env())
             raw = proc.stdout
             if proc.returncode == 0 and raw.strip():
@@ -548,6 +760,10 @@ def _ask_cloud(batch: list[str], key: str, chat_model: str, system: str,
                     slots.setdefault(n, []).append(piece)
             if all(i + 1 in slots for i in range(len(batch))):
                 return [" ".join(slots[i + 1]).strip() for i in range(len(batch))]
+            # 记录真实原因：旧日志一律写"只回 0 条"，看着像请求失败，其实是模型合并了短句、
+            # 少回一个标记（E08 实测约 1/4 的批发生，二分后全部补齐）
+            missing = [i + 1 for i in range(len(batch)) if i + 1 not in slots]
+            print(f"[mt] 标记不全（{len(batch)} 条缺 {len(missing)} 个：{missing[:5]}）→ 二分", file=sys.stderr)
             return None
         match = re.search(r"\[.*\]", content or "", re.S)
         if not match:
@@ -701,7 +917,7 @@ def write_srt(cues: list[dict], path: Path, translations: list[str] | None = Non
         if translations:
             lines.append(translations[i - 1])
         blocks.append(f"{i}\n{ts(cue['begin'])} --> {ts(cue['end'])}\n" + "\n".join(lines))
-    path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+    path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8", newline="\n")
     print(f"[srt] {len(cues)} 条 → {path}", flush=True)
 
 
@@ -720,9 +936,13 @@ def check_timeline(cues: list[dict], video: Path, partial: bool = False) -> None
         return
     if duration <= 0:
         return
+    if not cues:
+        print("[check] 对齐自检：没有切出任何字幕条", flush=True)
+        return
     last_end = cues[-1]["end"] / 1000.0
     tail_gap = duration - last_end
     gaps = [b["begin"] - a["end"] for a, b in zip(cues, cues[1:])]
+    max_gap = max(gaps) if gaps else 0.0      # 只有 1 条字幕时 gaps 为空（旧版 max() 直接 ValueError）
     big = [g for g in gaps if g > 20000]
     overlaps = [(a, b) for a, b in zip(cues, cues[1:]) if a["end"] > b["begin"] + 1]
     cover = last_end / duration * 100
@@ -738,11 +958,11 @@ def check_timeline(cues: list[dict], video: Path, partial: bool = False) -> None
     state = ("（小样，跳过覆盖率判定）" if partial and not flags
              else "⚠️ " + "；".join(flags) if flags else "✅ 覆盖率/空隙/重叠正常")
     print(f"[check] 对齐自检：覆盖到 {cover:.1f}%（末条 {last_end:.1f}s / 片长 {duration:.1f}s）、"
-          f"最大空隙 {max(gaps) / 1000:.1f}s、重叠 {len(overlaps)} 处 → {state}", flush=True)
+          f"最大空隙 {max_gap / 1000:.1f}s、重叠 {len(overlaps)} 处 → {state}", flush=True)
 
 
-def report_timing(stem: str, cues: list[dict], origin: str) -> None:
-    """打印阶段耗时并追加到 ~/.dsh/douyin-timing.log（与抖音分支共用同一份日志）。"""
+def report_timing(stem: str, cues: list[dict], origin: str, write_log: bool = True) -> None:
+    """打印阶段耗时；默认追加到 ~/.dsh/douyin-timing.log（评测/CI 用 --no-log 关掉，别污染宿主状态）。"""
     total = time.time() - T0
 
     def _fmt(x: float) -> str:
@@ -751,6 +971,8 @@ def report_timing(stem: str, cues: list[dict], origin: str) -> None:
     print(f"【耗时】探测 {_fmt(T['probe'])}s · 抽音轨 {_fmt(T['audio'])}s · 转写 {_fmt(T['asr'])}s · "
           f"翻译 {_fmt(T['mt'])}s · 写盘 {_fmt(T['write'])}s · 总计 {_fmt(total)}s"
           f"（{len(cues)} 条，{origin}）", flush=True)
+    if not write_log:
+        return
     try:
         log = Path.home() / ".dsh/douyin-timing.log"
         with log.open("a", encoding="utf-8") as fh:
@@ -791,6 +1013,8 @@ def main() -> None:
                     help="本地后端地址，如 llama-server --port 8080 或 mlx_lm.server")
     ap.add_argument("--timeout", type=int, default=TRANSLATE_TIMEOUT, help="单次 bl 调用超时秒数（默认 180）")
     ap.add_argument("--keep-audio", action="store_true")
+    ap.add_argument("--no-log", action="store_true",
+                    help="不追加 ~/.dsh/douyin-timing.log（评测/CI 用，避免污染宿主状态）")
     args = ap.parse_args()
 
     video: Path = args.video.expanduser().resolve()
@@ -805,8 +1029,18 @@ def main() -> None:
     wrap_source: bool | None = None      # None=按 origin 推断；复用缓存时取元数据里的值
     # 源字幕复用：抽内嵌字幕要把 2.8 GB 读一遍（外置机械盘实测 22 s），
     # 上次已经抽过且比视频新就直接用，省掉这 20 秒；--refresh-source 可强制重抽。
-    cached_source = out_dir / f"{stem}.source.srt"
-    source_meta = out_dir / f"{stem}.source.json"
+    # --asr-json 是"我就要用这份转写结果"的显式指令，必须压过缓存（否则它会被静默架空）。
+    # --asr-json 是"我就要用这份转写结果"的显式指令：强制走 ASR 分支，
+    # 压过缓存复用、内嵌轨与外挂字幕。否则它会被目录里的产物静默架空——
+    # 实测踩过两次：一次是自家 <基名>.source.srt（绕过 looks_bilingual），
+    # 一次是上一次 --no-translate 留下的单语 <基名>.srt。显式参数必须说了算。
+    if args.asr_json is not None and args.source != "asr":
+        print(f"[src] 指定 --asr-json → 强制走 ASR 分支（忽略 --source {args.source} 与目录里的中间产物）",
+              flush=True)
+        args.source = "asr"
+
+    cached_source = out_dir / f"{stem}{SOURCE_SUFFIX}.srt"
+    source_meta = out_dir / f"{stem}{SOURCE_SUFFIX}.json"
     if (not args.refresh_source and args.source in ("auto", "embedded")
             and cached_source.exists() and cached_source.stat().st_mtime >= video.stat().st_mtime):
         meta = None
@@ -866,15 +1100,18 @@ def main() -> None:
             else:
                 audio = Path(tmp) / f"{stem}.flac"
                 asr_json = out_dir / f"{stem}.asr.json"
+                _t0 = time.time()
                 extract_audio(video, audio)
+                T["audio"] = time.time() - _t0          # 真·抽音轨（ffmpeg 读盘）
+                _t0 = time.time()
                 transcribe(audio, asr_json, key, args.asr_model, args.source_lang)
+                T["asr"] = time.time() - _t0            # 真·转写（上传+排队+识别）
                 if args.keep_audio:
                     shutil.copy2(audio, out_dir / audio.name)
-        T["audio"] = time.time() - _stage          # 只算抽音轨；转写单独计时
         _stage = time.time()
         sentences = sentences_of(json.loads(asr_json.read_text(encoding="utf-8")))
         cues = cues_from_asr(sentences)
-        T["asr"] = time.time() - _stage
+        T["asr"] += time.time() - _stage                # 切 cue 计入转写阶段
         origin = "ASR 转写"
 
     T["probe"] = time.time() - _stage
@@ -886,28 +1123,30 @@ def main() -> None:
     check_timeline(cues, video, partial=bool(args.limit))
     print(f"[src] {origin}：{len(cues)} 条，{ts(cues[0]['begin'])} → {ts(cues[-1]['end'])}", flush=True)
 
-    source_srt = out_dir / f"{stem}.source.srt"
+    source_srt = out_dir / f"{stem}{SOURCE_SUFFIX}.srt"
     write_srt(cues, source_srt, wrap_source=False)
-    (out_dir / f"{stem}.source.json").write_text(json.dumps(
+    (out_dir / f"{stem}{SOURCE_SUFFIX}.json").write_text(json.dumps(
         {"cues": len(cues), "limited": bool(args.limit), "origin": origin,
          "wrap_source": bool(origin.startswith("ASR"))}, ensure_ascii=False), encoding="utf-8")
 
     # 同步校验：外挂/下载来的字幕可能与视频不同版本 —— 用音频对齐验一次（auto 时仅外挂字幕触发）
     if args.verify_sync == "on" or (args.verify_sync == "auto" and origin.startswith("外挂")):
-        if verify_sync(video, source_srt, out_dir):
-            cues = read_srt(source_srt)          # 用校正后的字幕重建时间轴
-            print(f"[sync] 已应用校正后的时间轴（{len(cues)} 条）", flush=True)
+        info = verify_sync(video, source_srt, out_dir)
+        if info:
+            cues = read_srt(source_srt)          # 以盘上的 source.srt 为准重建时间轴
+            print(f"[sync] 时间轴已核对（offset {info['offset']:+.3f}s、scale {info['scale']:.4f}"
+                  f"{'，已校正' if info['fixed'] else '，无需校正'}，{len(cues)} 条）", flush=True)
 
     if args.no_translate:
         _stage = time.time()
         final = out_dir / f"{stem}.srt"
         if final.exists() and looks_bilingual(final):
             # 只出原文时不要用单语文件覆盖已有的双语成品
-            final = out_dir / f"{stem}.mono.srt"
+            final = out_dir / f"{stem}{MONO_SUFFIX}.srt"
             print(f"[out] {stem}.srt 已是双语成品 → 本次单语输出写到 {final.name}", flush=True)
         write_srt(cues, final, wrap_source=False)
         T["write"] = time.time() - _stage
-        report_timing(stem, cues, origin)
+        report_timing(stem, cues, origin, write_log=not args.no_log)
         print(f"[done] {final}")
         return
 
@@ -957,7 +1196,7 @@ def main() -> None:
               wrap_source=origin.startswith("ASR") if wrap_source is None else wrap_source)
     T["write"] = time.time() - _stage
 
-    report_timing(stem, cues, origin)
+    report_timing(stem, cues, origin, write_log=not args.no_log)
     print(f"[done] {final}")
 
 

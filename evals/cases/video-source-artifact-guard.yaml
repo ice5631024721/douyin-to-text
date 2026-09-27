@@ -1,0 +1,70 @@
+id: video-source-artifact-guard
+title: 本地视频分支 —— --refresh-source/--asr-json 必须真生效，不被自家 .source.srt 劫持
+description: |
+  工作区里预置了本技能自己的中间产物 sample.source.srt（纯英文，能绕过 looks_bilingual
+  守卫，被 sidecar 兜底 glob 命中）。用例要求用 --refresh-source + --asr-json 重出原文：
+  产出必须来自 ASR JSON，而不是那份陈旧中间产物。这条正是 2026-09-27 实测踩到的
+  「显式参数被静默架空」缺陷的回归闸门。
+
+  判别不看退出码，看产物：① 文本来自 ASR JSON；② 无 STALE 标记；③ `.source.json` 的
+  origin 记的是 ASR 分支（不是"复用的 source.srt"）。另外**必须走默认 auto 路由**——
+  实测旧代码下 agent 自己补 `--source asr` 就能绕开被测路径（假绿），judge 会检查
+  transcript 里没有 `--source asr`，绕开即判 FAIL。
+
+  夹具内容用 context.files 内联而不是存成文件：仓库 .gitignore 有意禁止 *.srt / *.asr.json
+  入库（防他人作品的受版权内容），这里全是合成占位文本，内联即可，不必削弱那条规则。
+
+input:
+  prompt: |
+    工作区里有一段 7 秒的测试视频 sample.mkv（**没有内嵌字幕轨**），
+    和一份**已有的 ASR 转写结果** sample.asr.json。
+    douyin-to-text 这个 Skill 已装在工作区：.dsh-skills/douyin-to-text/
+    （脚本在 .dsh-skills/douyin-to-text/scripts/video_to_srt.py）。
+
+    请用该脚本重出原文：**强制重抽、忽略磁盘上已有的中间产物**，
+    即给 --refresh-source 与 --asr-json sample.asr.json，再加 --no-translate 只出原文、
+    --no-log 不要写时间日志。**不要加 --source**——必须走脚本默认的 auto 路由
+    （本用例要验的就是"默认路由下显式参数说了算"）。不要联网，不要调用任何 ASR 或翻译接口。
+    按 Skill 约定，字幕文件与视频同名同目录（工作区根目录）。
+
+    完成后只输出三行，不要多余解释：
+    OUT=<生成的 .source.srt 在工作区里的相对路径>
+    FIRST=<该文件第一条字幕的英文原文>
+    SOURCE=<实际使用的字幕来源，embedded / sidecar / asr 三选一>
+
+context:
+  repo_fixture: evals/fixtures/repos/video-guard
+  files:
+    # 自家中间产物：纯英文，正是能骗过 looks_bilingual 守卫的那种文件
+    "sample.source.srt": |
+      1
+      00:00:00,500 --> 00:00:02,000
+      STALE_SOURCE_MARKER must not survive a refresh.
+
+      2
+      00:00:03,000 --> 00:00:04,600
+      STALE_SOURCE_MARKER second stale line.
+    "sample.source.json": '{"cues": 2, "limited": false, "origin": "内嵌字幕轨 idx=2 srt/eng", "wrap_source": false}'
+    # 合成 ASR 结果：两句拉开 1s（>700ms 合并不上）、合计长度 85 字（>84 也合并不上），
+    # 保证切成 2 条而不是 1 条；只给句级时间戳，词级缺失会走脚本的比例切分回退路径。
+    "sample.asr.json": |
+      {"transcripts": [{"channel_id": 0, "content_duration_in_milliseconds": 7000, "sentences": [
+        {"begin_time": 500, "end_time": 2000, "sentence_id": 1,
+         "text": "FROM_ASR_JSON_ALPHA the quick brown fox."},
+        {"begin_time": 3000, "end_time": 4600, "sentence_id": 2,
+         "text": "FROM_ASR_JSON_BETA jumps over the lazy dog."}
+      ]}]}
+
+expect:
+  must_contain:
+    - "FROM_ASR_JSON_ALPHA the quick brown fox."
+  files_exist:
+    - "sample.source.srt"
+  file_contains:
+    - path: "sample.source.srt"
+      content: "FROM_ASR_JSON_ALPHA the quick brown fox."
+
+judge:
+  type: script
+  script_path: evals/fixtures/scripts/check-own-artifact-guard.sh
+  timeout_seconds: 30
