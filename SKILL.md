@@ -71,10 +71,16 @@ curl 逐张下载 `images[i].url_list[0]` 到 /tmp/dy_img_N.jpeg，用 read_imag
 python ~/.dsh/skills/douyin-to-text/scripts/video_to_srt.py "<视频>" \
   --out <输出目录> [--source auto|embedded|sidecar|asr] [--source-lang en] [--target-lang zh] \
   [--sub-index N] [--chat-model qwen-mt-flash] [--backend cloud|local] \
-  [--local-server http://127.0.0.1:8080] [--batch 20] [--workers 4] [--asr-json <已有.json>]
+  [--local-server http://127.0.0.1:8080] [--batch 20] [--workers 4] [--asr-json <已有.json>] \
+  [--refresh-source] [--verify-sync auto|on|off] [--limit N] [--no-log] [--cache-dir <目录>]
 ```
 
-产出：`<视频基名>.srt`（双语）、`.source.srt`（复用的原文）、`.<lang>.json`（译文缓存，按原文指纹校验，**重切不重付**）。
+**产出只有一个文件**：视频同目录的 `<视频基名>.srt`（双语；`--no-translate` 时是单语）。
+中间产物（`<基名>.source.srt` 原文、`.source.json` 元数据、`.asr.json` 转写结果、`.<lang>.json` 译文缓存）
+默认写进**平台缓存目录**——macOS `~/Library/Caches/douyin-to-text/`、Linux `$XDG_CACHE_HOME/douyin-to-text/`、
+Windows `%LOCALAPPDATA%\douyin-to-text\Cache`，同一视频按 `<基名>-<路径哈希>` 分子目录。
+**不要把中间产物写在视频旁边**（2026-09-27 用户明确要求：片库里只该多出一个 srt）。需要指定位置就 `--cache-dir`，
+评测/CI 通常传工作区内的目录以保持密闭。
 
 实测（一部 43.8 分钟 1080p MKV，内嵌 `eng/SDH` 字幕轨 766 条 → 清洗后 765 条）：
 
@@ -87,7 +93,7 @@ python ~/.dsh/skills/douyin-to-text/scripts/video_to_srt.py "<视频>" \
 质检：765/765 条有中文、0 重叠、0 乱序、无 >15 s 空隙；时间轴 `00:00:02 → 00:43:45` 与片长 2628.032 s 对齐。
 
 **两个省时机（第二次跑同一部片时）**：
-- **源字幕复用**：抽内嵌字幕要把整片读一遍（2.79 GB 外置机械盘实测 **22 s**）。产出目录里已有 `<基名>.source.srt` 且比视频新时自动复用，**跳过整片读盘**（探测 0.5 s）；`--refresh-source` 强制重抽。
+- **源字幕复用**：抽内嵌字幕要把整片读一遍（2.79 GB 外置机械盘实测 **22 s**）。缓存目录里已有 `<基名>.source.srt` 且比视频新时自动复用，**跳过整片读盘**（探测 0.5 s）；`--refresh-source` 强制重抽。
   复用带守卫：`<基名>.source.json` 记录条数与是否 `--limit` 截断过，**截断产物永不复用**（否则会静默只出前 N 条字幕）。
 - **同步校验 `--verify-sync auto|on|off`**：用 ffsubsync（音频 VAD + FFT）验证字幕是否真的对得上音轨，偏了就自动校正。`auto`（默认）只在**外挂字幕**时触发——内嵌轨本身就是视频的一部分，不需要验。
   双证实测：正对照（内嵌轨）报 `offset 0.000 / scale 1.0000`；反证（人为挪 +3.5 s）报 `offset -3.500` 并成功校正。成本约 13 s。
@@ -104,7 +110,7 @@ python ~/.dsh/skills/douyin-to-text/scripts/video_to_srt.py "<视频>" \
 
 ### 交付：只出字幕文件，**不要往播放器里装**
 
-**默认只做一件事**：把 `<视频基名>.srt` 写到视频同目录（脚本 `--out` 默认就是视频目录）。同名同目录是**跨平台通行**的自动加载约定，**不要**去写任何播放器的私有缓存/库目录——播放器不止一种，替用户选播放器是越界（2026-09-27 被明确要求回退：曾把成品拷进 selfvideo 缓存，已删）。
+**默认只做一件事**：把 `<视频基名>.srt` 写到视频同目录（脚本 `--out` 默认就是视频目录）。同名同目录是**跨平台通行**的自动加载约定，**不要**去写任何播放器的私有缓存/库目录——播放器不止一种，替用户选播放器是越界（2026-09-27 被明确要求回退：曾把成品拷进 selfvideo 缓存，已删）。同理，**不要往视频目录里堆中间产物**（`.source.srt`/`.asr.json`/`.zh.json` 都进缓存目录）：片库里只该多出一个 srt。
 
 | 场景 | 命名 / 位置 | 说明 |
 |---|---|---|
@@ -139,6 +145,7 @@ python ~/.dsh/skills/douyin-to-text/scripts/video_to_srt.py "<视频>" \
 - **自家产物会被当成"外挂字幕"读回来，且能架空显式参数**（两层，2026-09-27 各踩一次）：① `<基名>.source.srt`（纯英文）能绕过 `looks_bilingual` 守卫，被 sidecar 兜底 glob `<基名>*` 命中；② 上一次 `--no-translate` 留下的**单语** `<基名>.srt` 同样会被当成外挂字幕。两者的后果一样：`--asr-json`/`--refresh-source` 被静默架空、重跑仍出旧文本。修法两层：`sidecar_path()` 用 `_is_own_artifact()` 排除 `.source`/`.mono`；**`--asr-json` 直接强制 `--source asr`**（显式指定转写结果时，缓存、内嵌轨、外挂字幕一律让位）。判据：跑完先看日志 `[src]` 那行写的是什么来源，别只看退出码 0。
 - **单条字幕曾让自检崩**：`check_timeline` 的 `max(gaps)` 在只有 1 条 cue 时抛 `ValueError: max() iterable argument is empty`（实测：短夹具只有一句台词就必崩，试跑 agent 靠自己打补丁绕过）。已改成空列表安全取值。
 - **`--no-log`**：评测/CI 跑时加上，不追加 `~/.dsh/douyin-timing.log`（默认会追加，属宿主状态污染）。
+- **中间产物的落脚点**：默认 `~/Library/Caches/douyin-to-text/<基名>-<路径哈希>/`（Linux/Windows 见上），`--cache-dir` 可改。写在视频旁边会让片库每部片多出 4 个文件（2026-09-27 用户明确要求改掉）；评测里统一 `--cache-dir .cache` 保持密闭。
 - **平台支持只承诺实测过的**：macOS 是验证过的路径（含整集 44 分钟 MKV）；Linux 走同一 ffmpeg/ffprobe 链路但未实测；Windows 的工具发现（PATH 优先 + `bl.cmd` 经 `cmd /c` + `os.pathsep`）已按约定写好，**本机无 Windows，未实测**。任何平台排查的第一步都是确认 `ffprobe`/`bl` **能被直接执行**，而不是只 `which` 得到。
 - **`[mt] N 条只回 0 条 → 二分` 的真相是"标记不全"**：那是模型把短句并进相邻行、少回一个 `[[n]]`（实测约 1/4 的批，二分后全部补齐，成品零漏译），不是请求失败。日志现在直接写明缺几个标记。
 - macOS 无 `timeout`；整片转写/翻译放后台作业跑。

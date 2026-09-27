@@ -3,11 +3,12 @@ title: 本地视频分支 —— --refresh-source/--asr-json 必须真生效，�
 description: |
   工作区里预置了本技能自己的中间产物 sample.source.srt（纯英文，能绕过 looks_bilingual
   守卫，被 sidecar 兜底 glob 命中）。用例要求用 --refresh-source + --asr-json 重出原文：
-  产出必须来自 ASR JSON，而不是那份陈旧中间产物。这条正是 2026-09-27 实测踩到的
+  成品必须来自 ASR JSON，而不是那份陈旧中间产物。这条正是 2026-09-27 实测踩到的
   「显式参数被静默架空」缺陷的回归闸门。
 
-  判别不看退出码，看产物：① 文本来自 ASR JSON；② 无 STALE 标记；③ `.source.json` 的
-  origin 记的是 ASR 分支（不是"复用的 source.srt"）。另外**必须走默认 auto 路由**——
+  判别不看退出码，看产物：① 成品 sample.srt 的文本来自 ASR JSON；② 无 STALE 标记；
+  ③ `.cache/sample.source.json` 的 origin 记的是 ASR 分支（不是"复用的 source.srt"），
+  同时证明中间产物确实落在 --cache-dir 里而不是视频目录。另外**必须走默认 auto 路由**——
   实测旧代码下 agent 自己补 `--source asr` 就能绕开被测路径（假绿），judge 会检查
   transcript 里没有 `--source asr`，绕开即判 FAIL。
 
@@ -23,12 +24,14 @@ input:
 
     请用该脚本重出原文：**强制重抽、忽略磁盘上已有的中间产物**，
     即给 --refresh-source 与 --asr-json sample.asr.json，再加 --no-translate 只出原文、
-    --no-log 不要写时间日志。**不要加 --source**——必须走脚本默认的 auto 路由
-    （本用例要验的就是"默认路由下显式参数说了算"）。不要联网，不要调用任何 ASR 或翻译接口。
-    按 Skill 约定，字幕文件与视频同名同目录（工作区根目录）。
+    --no-log 不写时间日志、--cache-dir .cache 把中间产物放进工作区的 .cache。
+    **不要加 --source**——必须走脚本默认的 auto 路由（本用例要验的就是"默认路由下显式参数说了算"）。
+    不要联网，不要调用任何 ASR 或翻译接口。
+
+    视频目录里只许出现与视频同名的 .srt 成品。
 
     完成后只输出三行，不要多余解释：
-    OUT=<生成的 .source.srt 在工作区里的相对路径>
+    OUT=<生成的 .srt 在工作区里的相对路径>
     FIRST=<该文件第一条字幕的英文原文>
     SOURCE=<实际使用的字幕来源，embedded / sidecar / asr 三选一>
 
@@ -59,9 +62,10 @@ expect:
   must_contain:
     - "FROM_ASR_JSON_ALPHA the quick brown fox."
   files_exist:
-    - "sample.source.srt"
+    - "sample.srt"
+    - ".cache/sample.source.json"
   file_contains:
-    - path: "sample.source.srt"
+    - path: "sample.srt"
       content: "FROM_ASR_JSON_ALPHA the quick brown fox."
 
 judge:

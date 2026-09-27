@@ -19,9 +19,13 @@ Windows C:\ffmpeg\bin）、bailian CLI（bl，ASR 与云端翻译；Windows 上�
       [--chat-model qwen-mt-flash] [--backend cloud|local] [--local-server URL]
       [--asr-json <已有.json>] [--no-translate] [--batch 20] [--workers 4]
       [--refresh-source] [--verify-sync auto|on|off] [--limit N] [--no-log]
+      [--cache-dir <中间产物目录>]
 
-产出：**只有文件，不往任何播放器里装**——
-  <out>/<视频基名>.srt（双语）、.source.srt（复用的原文）、.<lang>.json（译文缓存，重切不重付）
+产出：**视频目录只多出一个 <视频基名>.srt**（双语，或 --no-translate 时的单语）——
+  中间产物（<基名>.source.srt / .source.json / .asr.json / .<lang>.json）默认写进平台缓存目录
+  （macOS ~/Library/Caches/douyin-to-text/、Linux $XDG_CACHE_HOME/douyin-to-text/、
+  Windows %LOCALAPPDATA%\\douyin-to-text\\Cache），可用 --cache-dir 改；这样既能"重切不重付"，
+  又不往片库里堆文件。
 与视频同名同目录即被 mpv / IINA / VLC / MPC-HC / PotPlayer / Infuse 自动加载；
 Plex / Jellyfin / Emby 需要语言后缀（<基名>.zh.srt 或 .zh-en.srt），由用户自行命名。
 """
@@ -160,6 +164,21 @@ def tool_env() -> dict:
     return env
 
 
+def default_cache_root() -> Path:
+    """中间产物的默认缓存根目录（按平台惯例）。
+
+    为什么不全写在视频目录：那些 `.source.srt` / `.source.json` / `.asr.json` / `.zh.json`
+    都是中间产物，用户真正要的只有 `<基名>.srt` 一个文件（2026-09-27 明确要求）。
+    放在这里既能"重切不重付"，又不污染片库目录。
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData/Local")
+        return Path(base) / "douyin-to-text" / "Cache"
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Caches/douyin-to-text"
+    return Path(os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")) / "douyin-to-text"
+
+
 def bl_env() -> dict:
     """bl 专用环境（等价于 tool_env，保留名字是因为调用点多）。"""
     return tool_env()
@@ -274,9 +293,10 @@ def looks_bilingual(path: Path) -> bool:
 def _is_own_artifact(cand: Path, video: Path) -> bool:
     """`<基名>.source.srt` / `<基名>.mono.srt` 是本技能自己写出的中间产物，不是"别人的外挂字幕"。
 
-    它们就落在视频目录里，且是纯英文 → 能绕过 looks_bilingual 守卫，被 sidecar 兜底 glob
-    （`<基名>*`）当成外挂字幕读回来。后果实测：修好切分器后重跑，--refresh-source 与
-    --asr-json 全被架空，成品仍是旧的无标点文本 —— 必须显式排除。
+    旧版本把它们写在视频目录里（现在默认落缓存目录，但片库里可能还留着历史文件），
+    且是纯英文 → 能绕过 looks_bilingual 守卫，被 sidecar 兜底 glob（`<基名>*`）
+    当成外挂字幕读回来。后果实测：修好切分器后重跑，--refresh-source 与 --asr-json 全被
+    架空，成品仍是旧的无标点文本 —— 必须显式排除。
     """
     if cand.suffix.lower() not in SIDECAR_EXTS:
         return False
@@ -989,6 +1009,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="视频 → 双语字幕（复用优先：内嵌字幕 > 外挂字幕 > ASR）")
     ap.add_argument("video", type=Path)
     ap.add_argument("--out", type=Path, default=None, help="输出目录（默认与视频同目录）")
+    ap.add_argument("--cache-dir", type=Path, default=None,
+                    help="中间产物目录（默认平台缓存目录，如 ~/Library/Caches/douyin-to-text/；"
+                         "视频目录只会多出 <基名>.srt 一个文件）")
     ap.add_argument("--source", choices=["auto", "embedded", "sidecar", "asr"], default="auto")
     ap.add_argument("--source-lang", default="en", help="ASR 语言提示 / 内嵌轨语言偏好")
     ap.add_argument("--target-lang", default="zh")
@@ -1027,9 +1050,12 @@ def main() -> None:
     cues: list[dict] | None = None
     origin = ""
     wrap_source: bool | None = None      # None=按 origin 推断；复用缓存时取元数据里的值
-    # 源字幕复用：抽内嵌字幕要把 2.8 GB 读一遍（外置机械盘实测 22 s），
-    # 上次已经抽过且比视频新就直接用，省掉这 20 秒；--refresh-source 可强制重抽。
-    # --asr-json 是"我就要用这份转写结果"的显式指令，必须压过缓存（否则它会被静默架空）。
+    # 中间产物（.source.srt / .source.json / .asr.json / 译文缓存）默认落在**缓存目录**，
+    # 不再堆在视频旁边——用户要的是"视频目录只多出一个 .srt"。
+    # 同一视频的缓存放在 <缓存根>/<基名>-<路径哈希前 8 位>/ 下，换目录的同名视频不会互相串。
+    cache_root = (args.cache_dir.expanduser().resolve() if args.cache_dir
+                  else default_cache_root() / f"{stem}-{hashlib.sha1(str(video).encode()).hexdigest()[:8]}")
+    cache_root.mkdir(parents=True, exist_ok=True)
     # --asr-json 是"我就要用这份转写结果"的显式指令：强制走 ASR 分支，
     # 压过缓存复用、内嵌轨与外挂字幕。否则它会被目录里的产物静默架空——
     # 实测踩过两次：一次是自家 <基名>.source.srt（绕过 looks_bilingual），
@@ -1039,8 +1065,10 @@ def main() -> None:
               flush=True)
         args.source = "asr"
 
-    cached_source = out_dir / f"{stem}{SOURCE_SUFFIX}.srt"
-    source_meta = out_dir / f"{stem}{SOURCE_SUFFIX}.json"
+    # 源字幕复用：抽内嵌字幕要把整片读一遍（2.79 GB 外置机械盘实测 22 s），
+    # 上次抽过且比视频新就直接用；--refresh-source 强制重抽。
+    cached_source = cache_root / f"{stem}{SOURCE_SUFFIX}.srt"
+    source_meta = cache_root / f"{stem}{SOURCE_SUFFIX}.json"
     if (not args.refresh_source and args.source in ("auto", "embedded")
             and cached_source.exists() and cached_source.stat().st_mtime >= video.stat().st_mtime):
         meta = None
@@ -1099,7 +1127,7 @@ def main() -> None:
                 print(f"[asr] 复用 {asr_json.name}", flush=True)
             else:
                 audio = Path(tmp) / f"{stem}.flac"
-                asr_json = out_dir / f"{stem}.asr.json"
+                asr_json = cache_root / f"{stem}.asr.json"
                 _t0 = time.time()
                 extract_audio(video, audio)
                 T["audio"] = time.time() - _t0          # 真·抽音轨（ffmpeg 读盘）
@@ -1107,7 +1135,7 @@ def main() -> None:
                 transcribe(audio, asr_json, key, args.asr_model, args.source_lang)
                 T["asr"] = time.time() - _t0            # 真·转写（上传+排队+识别）
                 if args.keep_audio:
-                    shutil.copy2(audio, out_dir / audio.name)
+                    shutil.copy2(audio, cache_root / audio.name)   # --keep-audio 也进缓存目录，片库不落文件
         _stage = time.time()
         sentences = sentences_of(json.loads(asr_json.read_text(encoding="utf-8")))
         cues = cues_from_asr(sentences)
@@ -1123,15 +1151,15 @@ def main() -> None:
     check_timeline(cues, video, partial=bool(args.limit))
     print(f"[src] {origin}：{len(cues)} 条，{ts(cues[0]['begin'])} → {ts(cues[-1]['end'])}", flush=True)
 
-    source_srt = out_dir / f"{stem}{SOURCE_SUFFIX}.srt"
+    source_srt = cache_root / f"{stem}{SOURCE_SUFFIX}.srt"
     write_srt(cues, source_srt, wrap_source=False)
-    (out_dir / f"{stem}{SOURCE_SUFFIX}.json").write_text(json.dumps(
+    (cache_root / f"{stem}{SOURCE_SUFFIX}.json").write_text(json.dumps(
         {"cues": len(cues), "limited": bool(args.limit), "origin": origin,
          "wrap_source": bool(origin.startswith("ASR"))}, ensure_ascii=False), encoding="utf-8")
 
     # 同步校验：外挂/下载来的字幕可能与视频不同版本 —— 用音频对齐验一次（auto 时仅外挂字幕触发）
     if args.verify_sync == "on" or (args.verify_sync == "auto" and origin.startswith("外挂")):
-        info = verify_sync(video, source_srt, out_dir)
+        info = verify_sync(video, source_srt, cache_root)
         if info:
             cues = read_srt(source_srt)          # 以盘上的 source.srt 为准重建时间轴
             print(f"[sync] 时间轴已核对（offset {info['offset']:+.3f}s、scale {info['scale']:.4f}"
@@ -1153,7 +1181,7 @@ def main() -> None:
     key = api_key(args.api_key)
     lines = [c["text"] for c in cues]
     fingerprint = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
-    cache_path = out_dir / f"{stem}.{args.target_lang}.json"
+    cache_path = cache_root / f"{stem}.{args.target_lang}.json"
     translations: list[str] | None = None
     if cache_path.exists() and not args.no_cache:
         try:

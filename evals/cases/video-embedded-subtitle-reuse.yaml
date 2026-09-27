@@ -1,9 +1,10 @@
 id: video-embedded-subtitle-reuse
-title: 本地视频分支 —— 有内嵌字幕轨必须复用（零 ASR），且只交付文件不装播放器
+title: 本地视频分支 —— 有内嵌字幕轨必须复用（零 ASR），且视频目录只多出一个 srt
 description: |
-  验证「本地视频文件 → 双语字幕」分支的复用优先级与交付边界：
-  视频自带英文 srt 轨时走 embedded 抽取而不是 ASR；产出按「同名同目录」落盘；
-  不得往播放器私有目录拷贝（播放器不止一种，替用户选播放器越界）。
+  验证「本地视频文件 → 双语字幕」分支的三件事：
+  ① 复用优先级：视频自带英文 srt 轨时走 embedded 抽取而不是 ASR；
+  ② 交付边界：**视频目录只多出一个 <基名>.srt**，中间产物（.source.srt/.source.json/.asr.json）
+     必须写进缓存目录，不许堆在片库里；也不得往播放器私有目录拷贝（播放器不止一种）。
 
 input:
   prompt: |
@@ -12,14 +13,14 @@ input:
     （脚本在 .dsh-skills/douyin-to-text/scripts/video_to_srt.py）。
 
     请按该 Skill 的「本地视频文件 → 双语字幕」分支处理它，但**只出原文、不要翻译**
-    （加 --no-translate），并且不要写时间日志（加 --no-log）。
-    不要联网，不要调用任何 ASR 或翻译接口。
-    按 Skill 约定，字幕文件与视频同名同目录（工作区根目录）。
+    （加 --no-translate），不写时间日志（加 --no-log），并把中间产物放进工作区里的
+    `.cache` 目录（加 --cache-dir .cache）。不要联网，不要调用任何 ASR 或翻译接口。
 
-    只生成字幕文件，**不要往任何播放器目录里拷贝**。
+    **视频目录里只许出现一个字幕文件**（与视频同名的 .srt）；中间产物一律进 .cache。
+    也不要往任何播放器目录里拷贝。
 
     完成后只输出下面三行，不要多余解释：
-    OUT=<生成的 .source.srt 在工作区里的相对路径>
+    OUT=<生成的 .srt 在工作区里的相对路径>
     FIRST=<该文件第一条字幕的英文原文>
     SOURCE=<实际使用的字幕来源，embedded / sidecar / asr 三选一>
 
@@ -33,9 +34,15 @@ expect:
   must_not_contain:
     - "dev.selfvideo.player"
   files_exist:
+    - "sample.srt"
+    - ".cache/sample.source.json"
+  files_not_exist:            # 中间产物不许留在视频目录
     - "sample.source.srt"
+    - "sample.source.json"
+    - "sample.asr.json"
+    - "sample.zh.json"
   file_contains:
-    - path: "sample.source.srt"
+    - path: "sample.srt"
       content: "SUB_FIXTURE_BETA jumps over the lazy dog."
 
 judge:

@@ -26,18 +26,25 @@
 python3 \
   scripts/video_to_srt.py "<视频>" --out <输出目录> \
   [--source auto|embedded|sidecar|asr] [--source-lang en] [--target-lang zh] \
-  [--sub-index N] [--no-translate] [--asr-json <已有.json>] [--no-log]
+  [--sub-index N] [--no-translate] [--asr-json <已有.json>] [--no-log] [--cache-dir <目录>]
 ```
 
-产出：`<视频基名>.srt`（双语）、`<视频基名>.source.srt`（复用的原文，便于复查/重译）、ASR 路线的 `<视频基名>.asr.json`。
-**重切不重付**：`--asr-json` 跳过解音轨与转写，只重切/重译——它是"我就要用这份转写"的显式指令，
+**产出只有一个文件**：视频同目录的 `<视频基名>.srt`（双语；`--no-translate` 时是单语）。
+中间产物——`<基名>.source.srt`（原文）、`.source.json`（元数据）、`.asr.json`（转写结果）、
+`.<lang>.json`（译文缓存）——默认写进**平台缓存目录**（macOS `~/Library/Caches/douyin-to-text/<基名>-<路径哈希>/`，
+Linux `$XDG_CACHE_HOME/douyin-to-text/`，Windows `%LOCALAPPDATA%\douyin-to-text\Cache`），`--cache-dir` 可改。
+既保住"**重切不重付**"，又不往片库里堆文件。
+
+`--asr-json` 跳过解音轨与转写，只重切/重译——它是"我就要用这份转写"的显式指令，
 会强制走 ASR 分支，压过缓存复用、内嵌轨与外挂字幕。
 
 实测（43.8 分钟 1080p MKV，内含 `eng/SDH` 文本轨）：766 条 → 清洗后 765 条，时间轴 `00:00:02 → 00:43:45` 与视频长度一致；全程零 ASR 调用，只付翻译。
 
-### 交付：只出字幕文件，**不要往播放器里装**
+### 交付：片库里只多出一个 srt，也不往播放器里装
 
-**默认只做一件事**：把 `<视频基名>.srt` 写到视频同目录（脚本 `--out` 默认就是视频目录）。同名同目录是**跨平台通行**的自动加载约定，**不要**去写任何播放器的私有缓存/库目录——播放器不止一种，替用户选播放器是越界。
+**默认只做两件事的边界**：① 把 `<视频基名>.srt` 写到视频同目录（脚本 `--out` 默认就是视频目录）；
+② 中间产物一律进缓存目录。同名同目录是**跨平台通行**的自动加载约定，**不要**去写任何播放器的
+私有缓存/库目录——播放器不止一种，替用户选播放器是越界。
 
 | 场景 | 命名 / 位置 | 说明 |
 | --- | --- | --- |
@@ -92,9 +99,9 @@ skill-up validate evals/eval.yaml
 skill-up run evals/eval.yaml --output-dir evals/.skill-up-workspace
 ```
 
-另有一份**不依赖 agent 的确定性自检**（约 10 秒、零网络零计费），守本地视频字幕分支的三条实测缺陷：
+另有一份**不依赖 agent 的确定性自检**（约 10 秒、零网络零计费），守本地视频字幕分支的四条实测要求：
 `PYTHON=/abs/path/python3 bash evals/fixtures/scripts/selftest-video-to-srt.sh`。
-实测：修复后 10/10 通过，HEAD 版 0/10（原文被自家 `.source.srt` 劫持 + 单条 cue 崩溃）。
+实测：修复后 13/13 通过，HEAD 版 0/10（原文被自家 `.source.srt` 劫持 + 单条 cue 崩溃）。
 
 > ⚠️ `environment.type: none` **不隔离** —— 被测 agent 直接跑在宿主机上。
 > 本地视频那两条用例会在工作区里跑真脚本（写 `.srt`/`.json`）；用例 prompt 已显式要求 `--no-log`，

@@ -56,12 +56,15 @@ agent 级用例有个天然弱点：**被测路径可以被 agent 绕过去**。
 PYTHON=/abs/path/python3 bash evals/fixtures/scripts/selftest-video-to-srt.sh [被测脚本]
 ```
 
-三个场景（全部用合成夹具，约 10 秒，零网络零计费）：
-① `--refresh-source --asr-json` 必须让原文来自 ASR JSON；② 同目录重跑、只给 `--asr-json`，
-显式参数仍要说了算；③ 只有 1 条 cue 时对齐自检不得崩。
+四个场景（全部用合成夹具，约 10 秒，零网络零计费）：
+① `--refresh-source --asr-json` 必须让成品来自 ASR JSON；② 同目录重跑、只给 `--asr-json`，
+显式参数仍要说了算；③ 只有 1 条 cue 时对齐自检不得崩；④ **默认缓存下视频目录只许多出一个 `.srt`**
+（中间产物必须落到缓存目录，场景内用临时 `HOME` 验默认落点）。
 
-**双证（同一命令、同一夹具，只换被测脚本）**：修复后 `10 通过 / 0 失败`（exit 0）；
+**双证（同一命令、同一夹具，只换被测脚本）**：修复后 `13 通过 / 0 失败`（exit 0）；
 HEAD 版 `0 通过 / 10 失败`（exit 1，原文被自家 `.source.srt` 劫持 + 单条 cue 崩溃）。
+场景 ④ 是新增要求，红侧就是改造前的真实产物：一集跑完片库里多出 `.source.srt`、`.source.json`、
+`.asr.json`、`.zh.json` 四个中间文件。
 这条是回归门禁的首选，skill-up 那 5 条用来验 agent 层的契约。
 
 ## 跑法
