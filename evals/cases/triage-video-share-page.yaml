@@ -6,7 +6,7 @@ input:
   prompt: |
     工作区里有一份抖音分享页 HTML：share.html。
 
-    严格按 douyin-to-text 这个 Skill 的「步骤 1：Triage + 取直链」做一次
+    严格按 omnisub 这个 Skill 的「步骤 1：Triage + 取直链」做一次
     不联网、不下载的纯解析，然后输出且仅输出下面四行（值取自文件内容本身）：
 
     DESC=<desc 原文>

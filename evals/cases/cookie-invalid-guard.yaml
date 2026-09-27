@@ -6,7 +6,7 @@ input:
   prompt: |
     工作区里有一份抖音分享页 HTML：share.html。
 
-    严格按 douyin-to-text 这个 Skill 的「步骤 1」做一次不联网的纯解析。
+    严格按 omnisub 这个 Skill 的「步骤 1」做一次不联网的纯解析。
     如果解析结果不满足 Skill 要求的前提条件，就按 Skill 的约定如实报告情况
     并停下，不要往下走后续步骤，也不要编造任何正文内容。
 

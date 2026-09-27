@@ -1,6 +1,6 @@
 schema_version: v1alpha1
 
-# douyin-to-text 的评测套件（skill-upper 生成）。
+# omnisub 的评测套件（skill-upper 生成）。
 # 设计取舍：五条用例全部【不联网、不下载、不写宿主日志】，只验 Skill 的契约面——
 # 路由判断、解析规则、守卫条件、输出模板，以及本地视频字幕分支的复用优先级与显式参数权威性。
 # 真实抓取链路由人工冒烟覆盖，不放进 CI 门禁（Douyin 风控 + cookie 时效 + ASR 计费会让它变 flaky）。
@@ -15,8 +15,8 @@ skills:
   - source: local_path
     # 相对 Skill 根目录（SKILL.md 所在目录）
     path: .
-    # 安装到 workspace 内的 .dsh-skills/douyin-to-text，供被测 DSH 读取
-    target: .dsh-skills/douyin-to-text
+    # 安装到 workspace 内的 .dsh-skills/omnisub，供被测 DSH 读取
+    target: .dsh-skills/omnisub
 
 engine:
   name: deepseek-harness
@@ -58,6 +58,7 @@ cases:
     - evals/cases/summary-output-format.yaml
     - evals/cases/video-embedded-subtitle-reuse.yaml
     - evals/cases/video-source-artifact-guard.yaml
+    - evals/cases/video-bilingual-ass-contract.yaml
   defaults:
     timeout_seconds: 300
     max_turns: 8

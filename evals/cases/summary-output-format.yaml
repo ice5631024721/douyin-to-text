@@ -7,7 +7,7 @@ input:
     工作区里有三个文件：desc.txt（抖音文案）、duration.txt（时长）、
     transcript.txt（已完成的 ASR 转写）。
 
-    严格按 douyin-to-text 这个 Skill 的「步骤 3：汇总输出」模板，把这三份
+    严格按 omnisub 这个 Skill 的「步骤 3：汇总输出」模板，把这三份
     材料整理成最终结果。要求：
 
     - 五个字段一个都不能少，字段名与 Skill 里写的完全一致
@@ -17,7 +17,7 @@ input:
     - 【耗时】行按 Skill 的五段式写法给出，数值你可以自拟
 
     不要联网，不要执行任何命令，不要写任何日志文件（尤其不要追加
-    ~/.dsh/douyin-timing.log）。
+    ~/.dsh/omnisub-timing.log）。
 
 context:
   repo_fixture: evals/fixtures/repos/summary-input

@@ -6,7 +6,7 @@ description: |
   成品必须来自 ASR JSON，而不是那份陈旧中间产物。这条正是 2026-09-27 实测踩到的
   「显式参数被静默架空」缺陷的回归闸门。
 
-  判别不看退出码，看产物：① 成品 sample.srt 的文本来自 ASR JSON；② 无 STALE 标记；
+  判别不看退出码，看产物：① 成品 sample.ass 的文本来自 ASR JSON；② 无 STALE 标记；
   ③ `.cache/sample.source.json` 的 origin 记的是 ASR 分支（不是"复用的 source.srt"），
   同时证明中间产物确实落在 --cache-dir 里而不是视频目录。另外**必须走默认 auto 路由**——
   实测旧代码下 agent 自己补 `--source asr` 就能绕开被测路径（假绿），judge 会检查
@@ -19,8 +19,8 @@ input:
   prompt: |
     工作区里有一段 7 秒的测试视频 sample.mkv（**没有内嵌字幕轨**），
     和一份**已有的 ASR 转写结果** sample.asr.json。
-    douyin-to-text 这个 Skill 已装在工作区：.dsh-skills/douyin-to-text/
-    （脚本在 .dsh-skills/douyin-to-text/scripts/video_to_srt.py）。
+    omnisub 这个 Skill 已装在工作区：.dsh-skills/omnisub/
+    （脚本在 .dsh-skills/omnisub/scripts/omnisub.py）。
 
     请用该脚本重出原文：**强制重抽、忽略磁盘上已有的中间产物**，
     即给 --refresh-source 与 --asr-json sample.asr.json，再加 --no-translate 只出原文、
@@ -28,10 +28,10 @@ input:
     **不要加 --source**——必须走脚本默认的 auto 路由（本用例要验的就是"默认路由下显式参数说了算"）。
     不要联网，不要调用任何 ASR 或翻译接口。
 
-    视频目录里只许出现与视频同名的 .srt 成品。
+    视频目录里只许出现与视频同名的 .ass 成品。
 
     完成后只输出三行，不要多余解释：
-    OUT=<生成的 .srt 在工作区里的相对路径>
+    OUT=<生成的 .ass 在工作区里的相对路径>
     FIRST=<该文件第一条字幕的英文原文>
     SOURCE=<实际使用的字幕来源，embedded / sidecar / asr 三选一>
 
@@ -47,7 +47,7 @@ context:
       2
       00:00:03,000 --> 00:00:04,600
       STALE_SOURCE_MARKER second stale line.
-    "sample.source.json": '{"cues": 2, "limited": false, "origin": "内嵌字幕轨 idx=2 srt/eng", "wrap_source": false}'
+    "sample.source.json": '{"cues": 2, "limited": false, "origin": "内嵌字幕轨 idx=2 srt/eng"}'
     # 合成 ASR 结果：两句拉开 1s（>700ms 合并不上）、合计长度 85 字（>84 也合并不上），
     # 保证切成 2 条而不是 1 条；只给句级时间戳，词级缺失会走脚本的比例切分回退路径。
     "sample.asr.json": |
@@ -62,10 +62,10 @@ expect:
   must_contain:
     - "FROM_ASR_JSON_ALPHA the quick brown fox."
   files_exist:
-    - "sample.srt"
+    - "sample.ass"
     - ".cache/sample.source.json"
   file_contains:
-    - path: "sample.srt"
+    - path: "sample.ass"
       content: "FROM_ASR_JSON_ALPHA the quick brown fox."
 
 judge:

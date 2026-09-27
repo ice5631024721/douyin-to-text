@@ -1,0 +1,79 @@
+id: video-bilingual-ass-contract
+title: 本地视频分支 —— 任意语言入口：源语言判定 + 默认语言对 + ASS 样式契约
+description: |
+  2026-09-27 的需求把这条分支从"英→中双语 SRT"扩成"**任意源语言 → 任意语言对的双语 ASS**"：
+  ① 交付物固定是 `.ass`（SRT 格式没有任何样式位，放不下"上面的字幕更醒目"）；
+  ② 默认语言对 `en,zh`，且**第一行在最上、用醒目的 Upper 样式**；
+  ③ 源语言要能自动判定（显式参数 → 字幕轨标签 → 文本启发式），中文源不能被当成英文源。
+
+  本用例只走**离线可验**的那一半：中文 ASR 结果 → 源语言判为 zh、默认语言对 en,zh、
+  产物是带 Upper/Lower 双样式与产出标记的 ASS、且不产出 SRT、不往片库堆中间产物。
+  **翻译方向本身（zh→en 的提示词与漏译判据）由 `selftest-langs.py` 的确定性闸门守**——
+  那部分必须直接查请求体才能发现（旧版把方向写死在提示词里，端到端跑一遍退出码照样是 0）。
+
+  夹具用 `video-guard`（合成小视频，无内嵌字幕轨）+ 内联的中文 ASR JSON，全程零网络零计费。
+
+input:
+  prompt: |
+    工作区里有一段测试视频 sample.mkv（**没有内嵌字幕轨**），
+    还有一份**中文**的 ASR 转写结果 cn.asr.json。
+    omnisub 这个 Skill 已装在工作区：.dsh-skills/omnisub/
+    （脚本在 .dsh-skills/omnisub/scripts/omnisub.py）。
+
+    请用该脚本处理它：给 --asr-json cn.asr.json，加 --no-translate 只出原文、--no-log 不写时间日志、
+    --cache-dir .cache 把中间产物放进工作区的 .cache。**不要加 --source**，走默认 auto 路由。
+    不要联网，不要调用任何 ASR 或翻译接口（不需要翻译，源语言行直接用原文）。
+
+    视频目录里只许出现与视频同名的字幕成品；不要往任何播放器目录里拷贝。
+
+    完成后只输出下面四行，不要多余解释：
+    OUT=<生成的字幕成品在工作区里的相对路径>
+    LANG=<脚本判定的源语言代号>
+    PAIR=<本次使用的输出语言对，逗号分隔>
+    FIRST=<成品里第一条字幕的正文>
+
+context:
+  repo_fixture: evals/fixtures/repos/video-guard
+  files:
+    # 中文转写结果：句子够长且拉开 1s，保证切成 2 条
+    "cn.asr.json": |
+      {"transcripts": [{"channel_id": 0, "content_duration_in_milliseconds": 7000, "sentences": [
+        {"begin_time": 500, "end_time": 2000, "sentence_id": 1,
+         "text": "就算是下地狱，上司也会比我们更深一层。"},
+        {"begin_time": 3000, "end_time": 4600, "sentence_id": 2,
+         "text": "有他们在前面，会不会走得快一点？"}
+      ]}]}
+
+expect:
+  must_contain:
+    - "OUT=sample.ass"
+    - "LANG=zh"
+    - "PAIR=en,zh"
+    - "就算是下地狱"
+  files_exist:
+    - "sample.ass"
+    - ".cache/sample.source.json"
+  files_not_exist:
+    - "sample.srt"              # 交付物只能是 ASS
+    - "sample.source.srt"       # 中间产物不许留在视频目录
+    - "sample.source.json"
+    - "sample.asr.json"
+  file_contains:
+    - path: "sample.ass"
+      content: "就算是下地狱，上司也会比我们更深一层。"
+    - path: "sample.ass"
+      content: "Style: Upper"
+    - path: "sample.ass"
+      content: "Style: Lower"
+    - path: "sample.ass"
+      content: "Title: omnisub"      # 产出标记：防止成品被当外挂字幕读回来
+    - path: "sample.ass"
+      content: "&H00FFFFFF"          # 上行纯白（醒目）
+    - path: "sample.ass"
+      content: "&H00E6EDF0"          # 下行暖白
+
+judge:
+  type: rule_based
+  success:
+    - output_contains:
+        all: ["OUT=sample.ass", "LANG=zh", "PAIR=en,zh"]

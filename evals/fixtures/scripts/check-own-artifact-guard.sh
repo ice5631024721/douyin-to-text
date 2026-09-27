@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 判定：交付物（sample.srt）的原文必须来自 --asr-json，而不是目录里那份自家中间产物
+# 判定：交付物（sample.ass）的原文必须来自 --asr-json，而不是目录里那份自家中间产物
 # sample.source.srt；且中间产物必须落在 --cache-dir 指定的缓存目录里，不留在视频目录。
 # 工作目录 = 用例工作区根目录（skill-up 约定）；退出码 0 = PASS。
 set -uo pipefail
-f=sample.srt
+f=sample.ass
 [ -f "$f" ] || { echo "FAIL: 交付物 $f 不存在"; exit 1; }
 
 grep -q "FROM_ASR_JSON_ALPHA" "$f"      || { echo "FAIL: $f 里没有 ASR JSON 的内容"; exit 1; }
