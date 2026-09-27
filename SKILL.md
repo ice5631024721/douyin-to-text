@@ -76,7 +76,7 @@ python ~/.dsh/skills/douyin-to-text/scripts/video_to_srt.py "<视频>" \
 
 产出：`<视频基名>.srt`（双语）、`.source.srt`（复用的原文）、`.<lang>.json`（译文缓存，按原文指纹校验，**重切不重付**）。
 
-实测（Undercover.Billionaire S01E02，43.8 分钟 1080p MKV，内嵌 `eng/SDH` 轨 766 条→清洗 765 条）：
+实测（一部 43.8 分钟 1080p MKV，内嵌 `eng/SDH` 字幕轨 766 条 → 清洗后 765 条）：
 
 | 阶段 | 耗时 | 关键点 |
 |---|---|---|
