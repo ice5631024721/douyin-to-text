@@ -32,6 +32,12 @@ dy_transcript.txt
 *.ass
 *.asr.json
 *.source.srt
+# 源字幕元数据 + 译文缓存（后者存的是整篇字幕译文，同样受版权保护）
+*.source.json
+*.zh.json
+*.en.json
+*.ja.json
+*.ko.json
 
 # ---- 评测运行产物（含完整 agent 会话轨迹与本地绝对路径）----
 evals/.skill-up-workspace/

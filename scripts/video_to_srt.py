@@ -16,7 +16,8 @@ bailian CLI（bl，ASR 与云端翻译）、可选 llama-server（本地翻译�
   python video_to_srt.py <video> [--out <dir>] [--source auto|embedded|sidecar|asr]
       [--source-lang en] [--target-lang zh] [--sub-index N] [--asr-model ...]
       [--chat-model qwen-mt-flash] [--backend cloud|local] [--local-server URL]
-      [--asr-json <已有.json>] [--no-translate] [--batch 40] [--workers 5]
+      [--asr-json <已有.json>] [--no-translate] [--batch 20] [--workers 4]
+      [--refresh-source] [--verify-sync auto|on|off] [--limit N]
 
 产出：<out>/<视频基名>.srt（双语）、.source.srt（复用的原文）、.<lang>.json（译文缓存，重切不重付）
 """
@@ -119,7 +120,13 @@ def ts(ms: int) -> str:
 
 
 def parse_ts(text: str) -> int:
-    h, m, rest = re.split(r"[:]", text.strip())
+    fields = re.split(r"[:]", text.strip())
+    if len(fields) == 2:                    # WebVTT 允许省略小时位：MM:SS,mmm
+        h, m, rest = "0", fields[0], fields[1]
+    elif len(fields) == 3:
+        h, m, rest = fields
+    else:
+        raise ValueError(f"无法解析时间戳：{text!r}")
     s, _, ms = rest.replace(".", ",").partition(",")
     return int(h) * 3600000 + int(m) * 60000 + int(s) * 1000 + int((ms or "0").ljust(3, "0")[:3])
 
@@ -180,14 +187,36 @@ def extract_embedded(video: Path, index: int | None, prefer_lang: str | None) ->
 
 
 # ---------------- 1b. 外挂字幕 ----------------
+def looks_bilingual(path: Path) -> bool:
+    """判断一份字幕是不是"我们自己产出的双语成品"（含大量中文）。
+
+    必须防住：成品 <视频基名>.srt 就落在视频目录，正是 sidecar 的首个命中路径；
+    不防就会把成品当原文回读（再把中文翻一遍）、或覆盖掉真正的英文外挂字幕。
+    """
+    try:
+        cues = read_srt(path)
+    except (OSError, ValueError):
+        return False
+    if not cues:
+        return False
+    zh = sum(1 for c in cues if re.search(r"[\u4e00-\u9fff]", c["text"]))
+    return zh / len(cues) > 0.3
+
+
 def sidecar_path(video: Path) -> Path | None:
     for ext in SIDECAR_EXTS:
         exact = video.with_suffix(ext)
         if exact.exists():
+            if looks_bilingual(exact):
+                print(f"[src] 跳过 {exact.name}：它看起来是双语成品（不是原文）", flush=True)
+                continue
             return exact
     stem = video.stem
     for cand in sorted(video.parent.glob(f"{stem}*")):
         if cand.suffix.lower() in SIDECAR_EXTS and cand != video:
+            if looks_bilingual(cand):        # 兜底路径同样要防"吃自己的产出"
+                print(f"[src] 跳过 {cand.name}：它看起来是双语成品（不是原文）", flush=True)
+                continue
             return cand
     return None
 
@@ -268,6 +297,10 @@ def verify_sync(video: Path, source_srt: Path, work_dir: Path) -> dict | None:
         print(f"[sync] ⚠️ 字幕与音轨不同步（offset {offset:+.3f}s、scale {scale:.4f}）→ 已用 ffsubsync 校正", flush=True)
     else:
         print(f"[sync] ✅ 同步正常（offset {offset:+.3f}s、scale {scale:.4f}）", flush=True)
+    try:
+        fixed.unlink()          # 临时产物，别在输出目录里留 synced.srt
+    except OSError:
+        pass
     return info
 
 
@@ -530,7 +563,7 @@ def _ask_cloud(batch: list[str], key: str, chat_model: str, system: str,
 
 def _translate_batch(batch: list[str], key: str, chat_model: str, system: str,
                      timeout: int = TRANSLATE_TIMEOUT, backend: str = "cloud",
-                     local_server: str = LOCAL_SERVER_DEFAULT, depth: int = 0) -> list[str]:
+                     local_server: str = LOCAL_SERVER_DEFAULT) -> list[str]:
     """一批 → 译文列表，长度恒等于输入。
 
     条数不符就二分（递归到单行），**绝不末尾补空**——补空等于把整批译文按错位映射出去。
@@ -548,12 +581,12 @@ def _translate_batch(batch: list[str], key: str, chat_model: str, system: str,
         return [out[0] if out else ""]
     mid = len(batch) // 2
     print(f"[mt] {len(batch)} 条只回 {len(out) if out else 0} 条 → 二分", file=sys.stderr)
-    return (_translate_batch(batch[:mid], key, chat_model, system, timeout, backend, local_server, depth + 1)
-            + _translate_batch(batch[mid:], key, chat_model, system, timeout, backend, local_server, depth + 1))
+    return (_translate_batch(batch[:mid], key, chat_model, system, timeout, backend, local_server)
+            + _translate_batch(batch[mid:], key, chat_model, system, timeout, backend, local_server))
 
 
 def repair_missing(lines: list[str], translations: list[str], key: str, chat_model: str,
-                   target: str, timeout: int, backend: str, local_server: str,
+                   system: str, timeout: int, backend: str, local_server: str,
                    rounds: int = 2) -> list[str]:
     """成批补译（每批 10 条，最多 rounds 轮），不逐行。"""
     for rnd in range(1, rounds + 1):
@@ -564,12 +597,18 @@ def repair_missing(lines: list[str], translations: list[str], key: str, chat_mod
         print(f"[mt] 第 {rnd} 轮补译：{len(bad)} 条", flush=True)
         for start in range(0, len(bad), 10):
             idx = bad[start:start + 10]
-            fixed = _translate_batch([lines[i] for i in idx], key, chat_model, target,
+            fixed = _translate_batch([lines[i] for i in idx], key, chat_model, system,
                                      timeout, backend, local_server)
             for i, t in zip(idx, fixed):
                 if re.search(r"[\u4e00-\u9fff]", t or ""):
                     translations[i] = t
     return translations
+
+
+def system_for(target: str) -> str:
+    """翻译系统提示词（translate 与 repair_missing 必须用同一份，否则补译风格会漂）。"""
+    return (f"You are a professional subtitle translator. Translate each English line into "
+            f"{target}. Keep the same order and count. Output ONLY a JSON array of strings.")
 
 
 def translate(lines: list[str], key: str, chat_model: str, target: str,
@@ -587,8 +626,7 @@ def translate(lines: list[str], key: str, chat_model: str, target: str,
     global _LIMITER
     _LIMITER = _RateLimiter(rpm)
 
-    system = (f"You are a professional subtitle translator. Translate each English line into "
-              f"{target}. Keep the same order and count. Output ONLY a JSON array of strings.")
+    system = system_for(target)
     batches = [lines[i:i + batch_size] for i in range(0, len(lines), batch_size)]
     results: list[list[str] | None] = [None] * len(batches)
     lock = threading.Lock()
@@ -671,6 +709,38 @@ T0 = time.time()
 T = {"probe": 0.0, "audio": 0.0, "asr": 0.0, "mt": 0.0, "write": 0.0}
 
 
+def check_timeline(cues: list[dict], video: Path, partial: bool = False) -> None:
+    """对齐自检：覆盖率 / 大空隙 / 重叠。这是"字幕与视频一一对应"的机器判据。
+
+    ASR 或外挂字幕都可能只覆盖片段，人工看不出来；这里直接给结论并落进日志。
+    """
+    try:
+        duration = float((ffprobe_json(video).get("format") or {}).get("duration") or 0)
+    except (SystemExit, ValueError, TypeError):
+        return
+    if duration <= 0:
+        return
+    last_end = cues[-1]["end"] / 1000.0
+    tail_gap = duration - last_end
+    gaps = [b["begin"] - a["end"] for a, b in zip(cues, cues[1:])]
+    big = [g for g in gaps if g > 20000]
+    overlaps = [(a, b) for a, b in zip(cues, cues[1:]) if a["end"] > b["begin"] + 1]
+    cover = last_end / duration * 100
+    flags = []
+    if tail_gap > max(30, duration * 0.02) and not partial:   # --limit 小样不该刷覆盖率告警
+        flags.append(f"末条到片尾还差 {tail_gap:.0f}s")
+    elif last_end > duration * 1.02 and not partial:
+        flags.append(f"字幕超出片尾 {last_end - duration:.0f}s（可能拿错集/版本不符）")
+    if big and not partial:
+        flags.append(f"{len(big)} 处 >20s 空隙")
+    if overlaps:
+        flags.append(f"{len(overlaps)} 处重叠")
+    state = ("（小样，跳过覆盖率判定）" if partial and not flags
+             else "⚠️ " + "；".join(flags) if flags else "✅ 覆盖率/空隙/重叠正常")
+    print(f"[check] 对齐自检：覆盖到 {cover:.1f}%（末条 {last_end:.1f}s / 片长 {duration:.1f}s）、"
+          f"最大空隙 {max(gaps) / 1000:.1f}s、重叠 {len(overlaps)} 处 → {state}", flush=True)
+
+
 def report_timing(stem: str, cues: list[dict], origin: str) -> None:
     """打印阶段耗时并追加到 ~/.dsh/douyin-timing.log（与抖音分支共用同一份日志）。"""
     total = time.time() - T0
@@ -714,7 +784,7 @@ def main() -> None:
                     help="用 ffsubsync 校验字幕与音轨是否同步：auto=仅外挂字幕时校验（默认）、on=总是、off=不校验")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 条字幕（小样验证用，0=全部）")
     ap.add_argument("--workers", type=int, default=4, help="翻译并发数（默认 4；受 60 次/分钟限流约束）")
-    ap.add_argument("--rpm", type=int, default=REQUESTS_PER_MIN, help="每分钟最大请求数（默认 45，限流上限 60）")
+    ap.add_argument("--rpm", type=int, default=REQUESTS_PER_MIN, help="每分钟最大请求数（默认 50，官方限额 60）")
     ap.add_argument("--backend", choices=["cloud", "local"], default="cloud",
                     help="翻译后端：cloud=bl text chat（默认 qwen-mt-flash）；local=本地 OpenAI 兼容服务")
     ap.add_argument("--local-server", default=LOCAL_SERVER_DEFAULT,
@@ -732,25 +802,31 @@ def main() -> None:
 
     cues: list[dict] | None = None
     origin = ""
+    wrap_source: bool | None = None      # None=按 origin 推断；复用缓存时取元数据里的值
     # 源字幕复用：抽内嵌字幕要把 2.8 GB 读一遍（外置机械盘实测 22 s），
     # 上次已经抽过且比视频新就直接用，省掉这 20 秒；--refresh-source 可强制重抽。
     cached_source = out_dir / f"{stem}.source.srt"
     source_meta = out_dir / f"{stem}.source.json"
     if (not args.refresh_source and args.source in ("auto", "embedded")
             and cached_source.exists() and cached_source.stat().st_mtime >= video.stat().st_mtime):
-        meta = {}
+        meta = None
         try:
             meta = json.loads(source_meta.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            meta = {}
+            meta = None
         cached_cues = read_srt(cached_source)
-        # 守卫：只有"完整抽取"的产物才复用。--limit 跑过的那份会被截断，复用它会静默少出字幕。
-        if meta.get("limited"):
+        # 守卫（失效关闭）：只有"完整抽取 + 元数据可读"才复用。
+        # 元数据缺失/损坏时无从判断是否被 --limit 截断 —— 宁可贵 20 秒重抽，也不能静默少出字幕
+        #（历史上 6739c59 那版在 --limit 下写截断的 source.srt 且不写 .source.json）。
+        if not isinstance(meta, dict):
+            print(f"[src] 缺少/损坏 {source_meta.name}，为安全起见不复用", flush=True)
+        elif meta.get("limited"):
             print(f"[src] 已有的 {cached_source.name} 来自 --limit 运行，不复用", flush=True)
         elif not cached_cues:
             print(f"[src] {cached_source.name} 为空，不复用", flush=True)
         else:
             cues = cached_cues
+            wrap_source = bool(meta.get("wrap_source"))
             origin = "复用的 source.srt（跳过抽取）"
             print(f"[src] 复用 {cached_source.name}（{len(cues)} 条，比视频新，跳过整片读盘）", flush=True)
     _stage = time.time()
@@ -765,9 +841,10 @@ def main() -> None:
                 cues, info = extract_embedded(video, args.sub_index, args.source_lang)
                 if cues:
                     origin = f"内嵌字幕轨 idx={info['index']} {info['codec']}/{info.get('language','?')}"
-            except SystemExit:
+            except SystemExit as exc:
                 if args.source == "embedded":
                     raise
+                print(f"[src] 内嵌字幕不可用（{exc}）→ 继续尝试其他来源", file=sys.stderr)
     if cues is None and args.source in ("auto", "sidecar"):
         found = sidecar_path(video)
         if found:
@@ -793,9 +870,10 @@ def main() -> None:
                 transcribe(audio, asr_json, key, args.asr_model, args.source_lang)
                 if args.keep_audio:
                     shutil.copy2(audio, out_dir / audio.name)
-        T["audio"] = time.time() - _stage
+        T["audio"] = time.time() - _stage          # 只算抽音轨；转写单独计时
         _stage = time.time()
-        cues = cues_from_asr(sentences_of(json.loads(asr_json.read_text(encoding="utf-8"))))
+        sentences = sentences_of(json.loads(asr_json.read_text(encoding="utf-8")))
+        cues = cues_from_asr(sentences)
         T["asr"] = time.time() - _stage
         origin = "ASR 转写"
 
@@ -805,13 +883,14 @@ def main() -> None:
         print(f"[limit] 仅处理前 {len(cues)} 条", flush=True)
     if not cues:
         raise SystemExit("没有切出任何字幕条")
+    check_timeline(cues, video, partial=bool(args.limit))
     print(f"[src] {origin}：{len(cues)} 条，{ts(cues[0]['begin'])} → {ts(cues[-1]['end'])}", flush=True)
 
     source_srt = out_dir / f"{stem}.source.srt"
     write_srt(cues, source_srt, wrap_source=False)
     (out_dir / f"{stem}.source.json").write_text(json.dumps(
         {"cues": len(cues), "limited": bool(args.limit), "origin": origin,
-         "video_mtime": video.stat().st_mtime}, ensure_ascii=False), encoding="utf-8")
+         "wrap_source": bool(origin.startswith("ASR"))}, ensure_ascii=False), encoding="utf-8")
 
     # 同步校验：外挂/下载来的字幕可能与视频不同版本 —— 用音频对齐验一次（auto 时仅外挂字幕触发）
     if args.verify_sync == "on" or (args.verify_sync == "auto" and origin.startswith("外挂")):
@@ -822,6 +901,10 @@ def main() -> None:
     if args.no_translate:
         _stage = time.time()
         final = out_dir / f"{stem}.srt"
+        if final.exists() and looks_bilingual(final):
+            # 只出原文时不要用单语文件覆盖已有的双语成品
+            final = out_dir / f"{stem}.mono.srt"
+            print(f"[out] {stem}.srt 已是双语成品 → 本次单语输出写到 {final.name}", flush=True)
         write_srt(cues, final, wrap_source=False)
         T["write"] = time.time() - _stage
         report_timing(stem, cues, origin)
@@ -836,12 +919,19 @@ def main() -> None:
     if cache_path.exists() and not args.no_cache:
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached.get("count") == len(lines) and cached.get("fingerprint") == fingerprint \
-                    and len(cached.get("translations") or []) == len(lines):
+            same_input = (cached.get("count") == len(lines)
+                          and cached.get("fingerprint") == fingerprint
+                          and len(cached.get("translations") or []) == len(lines))
+            same_engine = (cached.get("model") == args.chat_model
+                           and cached.get("backend", "cloud") == args.backend)
+            if same_input and same_engine:
                 translations = [str(x) for x in cached["translations"]]
-                print(f"[mt] 复用译文缓存 {cache_path.name}（{len(translations)} 条）", flush=True)
-        except (json.JSONDecodeError, KeyError, TypeError):
-            translations = None
+                print(f"[mt] 复用译文缓存 {cache_path.name}（{len(translations)} 条，{args.chat_model}）", flush=True)
+            elif same_input:
+                print(f"[mt] 缓存来自 {cached.get('model')}/{(cached.get('backend') or 'cloud')}，"
+                      f"与本次 {args.chat_model}/{args.backend} 不符 → 重新翻译", flush=True)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            print(f"[mt] 缓存损坏（{type(exc).__name__}）→ 忽略并重译：{cache_path.name}", file=sys.stderr)
     _stage = time.time()
     if translations is None:
         translations = translate(lines, key, args.chat_model, args.target_lang,
@@ -850,20 +940,21 @@ def main() -> None:
                                  backend=args.backend, local_server=args.local_server, rpm=args.rpm)
         cache_path.write_text(json.dumps(
             {"fingerprint": fingerprint, "count": len(lines), "model": args.chat_model,
-             "translations": translations}, ensure_ascii=False), encoding="utf-8")
+             "backend": args.backend, "translations": translations}, ensure_ascii=False), encoding="utf-8")
         print(f"[mt] 译文已缓存 → {cache_path.name}（重切/重跑不再重复付费）", flush=True)
     # 补译校验：漏条/回原文的行成批补译（不逐行，避免 429 与慢）
     if any(not re.search(r"[\u4e00-\u9fff]", t or "") for t in translations):
-        translations = repair_missing(lines, translations, key, args.chat_model, args.target_lang,
+        translations = repair_missing(lines, translations, key, args.chat_model, system_for(args.target_lang),
                                       args.timeout, args.backend, args.local_server)
         if cache_path is not None:
             cache_path.write_text(json.dumps(
                 {"fingerprint": fingerprint, "count": len(lines), "model": args.chat_model,
-                 "translations": translations}, ensure_ascii=False), encoding="utf-8")
+                 "backend": args.backend, "translations": translations}, ensure_ascii=False), encoding="utf-8")
     T["mt"] = time.time() - _stage
     _stage = time.time()
     final = out_dir / f"{stem}.srt"
-    write_srt(cues, final, translations, wrap_source=origin.startswith("ASR"))
+    write_srt(cues, final, translations,
+              wrap_source=origin.startswith("ASR") if wrap_source is None else wrap_source)
     T["write"] = time.time() - _stage
 
     report_timing(stem, cues, origin)

@@ -50,7 +50,7 @@ curl -s -X POST https://dashscope.aliyuncs.com/compatible-mode/v1/audio/transcri
 
 - `bl speech recognize` **同步模式上限 300 秒音频**，超出报 `audio duration over service process (300s)`——长音频按 ≤280 秒/片切分，各片**并行**转写后按序拼接
 - **bl 输出流反直觉：转写正文在 stdout，`[Model:...]` banner 在 stderr**。收正文用 `2>/dev/null` 直接拿 stdout；`--output json` 在当前版本不可靠，按纯文本收
-- 本机 ffmpeg 断链（x264 dylib 缺失），音视频转换一律用 macOS 原生 `afconvert`
+- 本机 `ffmpeg`/`ffprobe` 已于 2026-09-27 用 `brew reinstall ffmpeg` 修好（均 9.0.2，`/opt/homebrew/bin`）；音视频一律走它们，**不用 PyAV**（`afconvert` 读不了 MKV）
 
 ## 整片带时间戳转写（字幕用，2026-09-27 实测）
 
@@ -65,18 +65,20 @@ bl speech recognize --url /tmp/e02_16k.flac \
 - 实测：43.8 分钟音频（16 kHz 单声道 FLAC，48 MB）**62 秒**返回，**无 300 秒限制**
 - JSON 结构：`transcripts[0].sentences[]`，每句含 `begin_time`/`end_time`（毫秒）、`text`、`sentence_id`，以及**词级** `words[]`（`begin_time`/`end_time`/`text`/`punctuation`/`confidence`）——字幕切分与对齐用这一层
 - 覆盖率自检：末句 `end_time` 应接近容器时长（实测 2626.8s vs 2628s），并确认相邻句之间没有 >15s 的空隙
-- 解音轨用 PyAV：`~/.local/bin/uv run --with av --with numpy python scripts/video_to_srt.py …`；`afconvert` **读不了 MKV**（AVFoundation 不支持 Matroska）
+- 解音轨/抽字幕用 `ffmpeg`：`~/.local/bin/python3 scripts/video_to_srt.py …`（`ffprobe` 探轨、`ffmpeg -map 0:<idx> -c:s srt` 抽字幕、`-vn -ac 1 -ar 16000 -c:a flac` 抽音轨）
 
 ## 翻译：bl text chat（字幕双语化用）
 
 ```bash
-bl text chat --model qwen3.8-flash --messages-file /tmp/msg.json \
+bl text chat --model qwen-mt-flash --messages-file /tmp/msg.json \
   --api-key "$KEY" --output json --quiet
 ```
 
 - `--messages-file` 收 JSON messages 数组（`-` 可走 stdin）；系统提示要求"逐行翻译、顺序与条数同输入、只输出 JSON 数组"
 - **输出形态不固定**：实测直接返回模型正文的 JSON 数组（`["译文1","译文2"]`），也可能包成 `{choices:[{message:{content}}]}`——解析要三种都吃（见 `scripts/video_to_srt.py` 的 `translate()`）
-- 批大小 40 行为宜（实测 40 条/批比 20 条/批更划算）；**务必带 `--timeout 180`**（默认超时偏短，并发下易 ETIMEDOUT）；模型用 `qwen3.8-flash`，`qwen3.8-max` 约慢一倍；返回条数与输入不符时脚本告警并逐行兜底，避免整批丢字幕
+- **批大小 20 最稳**：实测 40 条/批会让模型把短句并进相邻行、条数不符触发大量二分（400 条跑了 142 秒、49 次二分），20 条/批同样内容只要 32 秒。
+- 协议用**编号标记**（每行前缀 `[[n]]`，模型拆句也能按标记归位）；条数不符**递归二分**、漏条**成批补译**，绝不「末尾补空」（那会让整批译文错位）。
+- 配 4 并发 + **50 次/分钟限速器**（官方限额 60 次/分钟 + 3.5 万 token/分钟；逐行翻译必被 429，退避比限速更慢）；**务必带 `--timeout 180`**。
 
 ## 模型选型与费用（2026-09-27 实测，价格取自百炼模型目录）
 
@@ -118,7 +120,7 @@ bl model list --model <model-id> --output json | python3 -c "import json,sys;m=(
 
 ```bash
 # llama.cpp（官方 GGUF 量化版，Apple Metal）
-llama-server -m ~/models/tencent/Hy-MT2-7B-GGUF/Hy-MT2-7B-Q4_K_M.gguf --port 8080 -ngl 99
+llama-server -m <自备的 Hy-MT2-7B GGUF> --port 8080 -ngl 99   # 模型需自行下载（本机评测后已删除）
 python scripts/video_to_srt.py <video> --backend local --local-server http://127.0.0.1:8080
 ```
 本地用 Hy-MT2 官方的「分隔符」提示模板（`|||` 分段），脚本按分隔符切回。实测 Apple M4：Q4_K_M 19.95 tok/s、4.06 GB；MLX 8bit 12.0 tok/s、8.26 GB；质量与云端基本持平（中立裁判 6:6/6:7），但慢 8–25 倍。

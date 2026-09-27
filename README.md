@@ -18,12 +18,12 @@
 | --- | --- | --- |
 | 1 | 内嵌字幕轨 | MKV/MP4 里的 srt/ass/文本轨（含 SDH）→ 直接复用原时间轴 |
 | 2 | 同目录外挂字幕 | `<视频基名>.srt` / `.ass` / `.vtt`（含带语言后缀的同名文件） |
-| 3 | ASR 转写 | 前两者都没有才走：PyAV 解 16 kHz 单声道 FLAC → `bl speech recognize` 异步 filetrans（句级 `begin_time/end_time` ＋词级 `words[]`）→ 按字幕规范切 cue |
+| 3 | ASR 转写 | 前两者都没有才走：`ffmpeg` 解 16 kHz 单声道 FLAC → `bl speech recognize` 异步 filetrans（句级 `begin_time/end_time` ＋词级 `words[]`）→ 按字幕规范切 cue |
 
-拿到原文后统一用 `bl text chat` 批量**并行**翻译（默认 5 并发、按批索引回填，顺序不乱），写出「原文行 + 译文行」的双语 SRT。
+拿到原文后统一用 `bl text chat`（默认 `qwen-mt-flash`）批量**并行**翻译：**20 条/批 × 4 并发**，走编号标记协议（每行前缀 `[[n]]`，模型拆句也能按标记归位）；条数不符递归二分、漏条成批补译，配 50 次/分钟限速器（官方限额 60）。写出「原文行 + 译文行」的双语 SRT。
 
 ```bash
-~/.local/bin/uv run --with av --with numpy python \
+~/.local/bin/python3 \
   scripts/video_to_srt.py "<视频>" --out <输出目录> \
   [--source auto|embedded|sidecar|asr] [--source-lang en] [--target-lang zh] \
   [--sub-index N] [--no-translate] [--asr-json <已有.json>]
@@ -64,7 +64,7 @@ ASR / 翻译通道与实测约束见 [`ASR-API.md`](ASR-API.md)。
 SKILL.md                 # Skill 本体：triage 规则、三条分支、输出模板、计时约定
 ASR-API.md               # ASR 与翻译通道：bailian CLI / 原生异步 API / OpenAI 兼容端点
 scripts/
-  video_to_srt.py        # 本地视频 → 双语字幕（复用优先，PyAV + bailian CLI）
+  video_to_srt.py        # 本地视频 → 双语字幕（复用优先，ffmpeg/ffprobe + bailian CLI）
 evals/
   eval.yaml              # skill-up 评测套件（3 条用例，全部离线）
   cases/*.yaml           # 用例定义与断言
@@ -104,7 +104,7 @@ skill-up run evals/eval.yaml --output-dir evals/.skill-up-workspace
 
 ## 环境要求
 
-- `python3` ＋ [`uv`](https://docs.astral.sh/uv/)（`scripts/video_to_srt.py` 用 `uv run --with av --with numpy` 拉起 PyAV，**不依赖系统 ffmpeg**）
+- `python3` 3.10+（`scripts/video_to_srt.py` 只用标准库）＋ **`ffmpeg`/`ffprobe`**（探轨、抽字幕、抽音轨）＋ `bl`（bailian CLI，ASR 与翻译）
 - `bailian` CLI（`bl`）＋ 一个可用的 ASR / 文本模型额度（见 `ASR-API.md`）
 - 抖音分支在 macOS 上依赖系统原生 `afconvert` 做音视频转换（Linux 请替换为 `ffmpeg`）
 
