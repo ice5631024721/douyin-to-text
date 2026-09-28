@@ -41,7 +41,11 @@
 
 ### 翻译
 
-拿到原文后用 `bl text chat`（默认 `qwen-mt-flash`）批量**并行**翻译，30 条/批 × 4 并发，走编号标记协议。
+拿到原文后批量**并行**翻译，30 条/批 × 4 并发，走编号标记协议。默认模型 `qwen3.7-flash`
+（直连 dashscope HTTP 并显式 `enable_thinking:false`——Qwen3 服务端默认开思考、bl 传不了关闭字段，
+实测漏发慢 66 倍；qwen-mt 系仍可 `--chat-model` 切回、走 `bl text chat`）。非 qwen-mt 模型的提示词
+带风格指令（习语意译、禁止逐字直译）：qwen-mt 对 "if it's not one thing, it's another" 这类透明型习语
+只会直译（「要不是一件事，就是另一件事」），qwen3.7-flash 意译（「麻烦事一桩接一桩」）。
 
 关键设计是**按整句翻译再切回 cue**：ASR 切出的"半句话"直接送 MT，模型会把相邻两句合并、并按顺序
 重新编号，合并点之后整段错位。先合并成完整句子再翻，模型就没有可合并的对象；译文再按各 cue 的
@@ -67,7 +71,7 @@ chmod 600 ~/.dsh/douyin-cookies.txt
 ```bash
 omnisub "<视频>" --out <输出目录> \
   [--source auto|embedded|sidecar|asr] [--source-lang auto|en|zh|ja|ko|fr|…] \
-  [--subtitles en,zh] [--sub-index N] [--chat-model qwen-mt-flash] [--backend cloud|local] \
+  [--subtitles en,zh] [--sub-index N] [--chat-model qwen3.7-flash] [--backend cloud|local] \
   [--asr-chunk 0|1|4|N] [--asr-workers 4] [--asr-json <已有.json>] \
   [--refresh-source] [--verify-sync auto|on|off] [--limit N] [--audio-lossless] \
   [--allow-desync] [--no-repair-desync] [--keep-overlaps] [--cache-dir <目录>] [--no-log]

@@ -106,9 +106,15 @@ def code_rev() -> str:
 
 
 ASR_MODEL_DEFAULT = "qwen-audio-3.1-asr-flash-filetrans"
-# 实测（2026-09-27，765 条字幕）：flash 与 max 译文质量相当，flash 快约一倍
-# qwen-mt-turbo 与 gummy-* 于 2026-10-10 下线；qwen-mt-flash 同价同档且在售（见 ASR-API.md）
-CHAT_MODEL_DEFAULT = "qwen-mt-flash"
+# 翻译默认模型 = qwen3.7-flash（2026-09-28 用户定版：走 dashscope API 按量流量，key 仍是
+# ~/.agentmemory/.env 那把；token-plan 不含此模型，实测 404 Model not exist）。
+# 为什么换：qwen-mt-flash 是 MT 专用模型，对"透明型习语"只会字面直译——
+# "if it's not one thing, it's another" → 「要不是一件事，就是另一件事」；且加风格指令 /
+# 原生 translation_options.domains / 升 qwen-mt-plus 全部无效（同日 A/B 实测，见 ASR-API.md）。
+# qwen3.7-flash + 风格指令实测意译（「麻烦事一桩接一桩，没完没了」），30 条整批 30/30
+# 标记协议服从、7.5 s/批；0.2/0.4 元每百万 tokens ≈ 0.01 元/集。qwen3-max 本项目禁用（用户令）。
+# qwen-mt-* 仍可用（--chat-model qwen-mt-flash），其提示词与 bl 传输路径逐字节未动。
+CHAT_MODEL_DEFAULT = "qwen3.7-flash"
 LOCAL_SERVER_DEFAULT = "http://127.0.0.1:8080"
 DELIM = "\n|||\n"
 
@@ -641,20 +647,30 @@ def doctor_probe_models(key: str, asr_model: str, chat_model: str) -> bool:
     """
     good = True
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
-            json.dump([{"role": "user", "content": "回复 ok"}], fh, ensure_ascii=False)
-            msg_file = fh.name
-        proc = subprocess.run(_bl_argv(find_bl()) + [
-            "text", "chat", "--model", chat_model, "--messages-file", msg_file, "--api-key", key,
-            "--output", "json", "--quiet", "--timeout", "60"],
-            capture_output=True, text=True, env=bl_env())
-        detail = (proc.stderr or "") + (proc.stdout or "")
-        if proc.returncode == 0 and proc.stdout.strip() and '"error"' not in detail[:400]:
+        if _needs_direct_http(chat_model):
+            # doctor 必须走与生产相同的传输（qwen3 系直连+关思考），否则绿字验的不是出货路径
+            raw, err = _http_chat([{"role": "user", "content": "回复 ok"}], key, chat_model, 60)
+            detail = err or raw
+            probe_ok = bool(raw.strip()) and '"error"' not in detail[:400]
+            service = "翻译（dashscope chat）"
+        else:
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                             encoding="utf-8") as fh:
+                json.dump([{"role": "user", "content": "回复 ok"}], fh, ensure_ascii=False)
+                msg_file = fh.name
+            proc = subprocess.run(_bl_argv(find_bl()) + [
+                "text", "chat", "--model", chat_model, "--messages-file", msg_file, "--api-key", key,
+                "--output", "json", "--quiet", "--timeout", "60"],
+                capture_output=True, text=True, env=bl_env())
+            detail = (proc.stderr or "") + (proc.stdout or "")
+            probe_ok = proc.returncode == 0 and proc.stdout.strip() and '"error"' not in detail[:400]
+            service = "翻译（bl text chat）"
+        if probe_ok:
             print(f"[doctor] 翻译模型 ✅ {chat_model} 实测可调用")
         else:
             good = False
             print(f"[doctor] 翻译模型 ❌ {chat_model} 实测失败")
-            for line in config_hint_lines("翻译（bl text chat）", detail):
+            for line in config_hint_lines(service, detail):
                 print(f"[doctor]   {line}")
     except (OSError, SystemExit) as exc:
         good = False
@@ -1758,6 +1774,53 @@ def _translate_local(batch: list[str], server: str, timeout: int,
     return parts if len(parts) == len(batch) else None
 
 
+def style_note(src: str, tgt: str) -> str:
+    """通用指令模型的风格指令（只拼进非 qwen-mt 分支的 user 消息末尾）。
+
+    这是换模型收益的来源：qwen-mt 系对提示词里的自由文本指令无动于衷（实测加风格指令
+    与不加一字不差），而通用指令模型加了才会把习语意译——
+    实测（2026-09-28，qwen3.7-flash）"if it's not one thing, it's another" →
+    「麻烦事一桩接一桩，没完没了」。方向与语言名进模板，zh→en 等方向同样适用。
+    """
+    return (f"\n\n翻译要求：这是影视对白（口语）。遇到{src}习语或惯用表达必须意译成{tgt}里"
+            "对应的自然说法，禁止逐字直译；译文要像母语者平时说话那样自然。")
+
+
+# qwen3 系的服务端**默认开思考**：实测同一句翻译，不发 enable_thinking 字段 = 39.4 s、
+# 2353 输出 tokens（其中 6877 字是思考）；显式 False = 0.6 s、10 tokens（2026-09-28）。
+# bl text chat 只有 --enable-thinking（开启用），请求体根本不带该字段（--dry-run 实证）
+# → qwen3 系必须直连 HTTP 关思考，不能走 bl（否则每批慢 10-60 倍，整集翻译多花几分钟）。
+DASHSCOPE_CHAT_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+
+
+def _needs_direct_http(chat_model: str) -> bool:
+    """哪些模型 bl 传不了必需参数、必须直连。目前只有 qwen3 系（关思考字段）。"""
+    return chat_model.startswith("qwen3")
+
+
+def _http_chat(messages: list[dict], key: str, chat_model: str, timeout: int) -> tuple[str, str]:
+    """直连 OpenAI 兼容端点发一次 chat。返回 (raw_body, err_detail)；成功时 err 为空。"""
+    body = {"model": chat_model, "messages": messages, "temperature": 0.3,
+            "max_tokens": 4096, "enable_thinking": False}   # Qwen3 默认开思考，必须显式关
+    req = urllib.request.Request(
+        DASHSCOPE_CHAT_URL, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", "replace"), ""
+    except Exception as exc:
+        detail = ""
+        if isinstance(exc, urllib.error.HTTPError):
+            try:
+                detail = exc.read().decode("utf-8", "replace").strip()
+            except Exception:
+                detail = ""
+            detail = detail or f"HTTP {exc.code} {exc.reason}"
+        else:
+            detail = f"{type(exc).__name__} {str(exc)[:160]}"
+        return "", detail[-500:]
+
+
 def _cloud_payload(batch: list[str], chat_model: str, system: str,
                    src_lang: str, tgt_lang: str) -> list[dict]:
     """构造请求体。qwen-mt-* 只吃 user/assistant（带 system 会 400）。
@@ -1766,18 +1829,28 @@ def _cloud_payload(batch: list[str], chat_model: str, system: str,
     于是 --target-lang en 完全失效（拿中文当输入也照样要求译成中文），
     实测产出是"中文原样重复两遍"的假双语。方向必须进提示词，且要与语言对一致。
     """
-    if not chat_model.startswith("qwen-mt"):
-        return [{"role": "system", "content": system},
-                {"role": "user", "content": json.dumps({"lines": batch}, ensure_ascii=False)}]
     src, tgt = lang_name(src_lang), lang_name(tgt_lang)
+    if chat_model.startswith("qwen-mt"):
+        if len(batch) == 1:
+            return [{"role": "user", "content": f"把下面这句{src}翻译成{tgt}，只输出译文：\n" + batch[0]}]
+        # 编号标记协议：模型偶尔把一句拆成两条（实测 20 条回 23/25 条），二分永远不收敛；
+        # 带 [[n]] 标记就能把拆出来的片段按标记归位，一次请求拿全，不用反复二分。
+        marked = "\n".join(f"[[{i + 1}]] {x}" for i, x in enumerate(batch))
+        return [{"role": "user", "content":
+                 f"把下面每一行{src}翻译成{tgt}。必须原样保留每行开头的编号标记 [[n]]，"
+                 "一个标记对应一条译文，不要合并或拆分编号，**最后一行也要单独给出它的编号**：\n" + marked}]
+    # 通用指令模型（qwen3.7-flash 等）：同样走编号标记协议——下方解析本就按 [[n]] 切片、
+    # 模型无关，实测 30 条整批 30/30 标记、顺序正确（2026-09-28）。
+    # system 参数在这条分支不进请求：实测形态就是单条 user 消息，别引入未测过的变量。
+    note = style_note(src, tgt)
     if len(batch) == 1:
-        return [{"role": "user", "content": f"把下面这句{src}翻译成{tgt}，只输出译文：\n" + batch[0]}]
-    # 编号标记协议：模型偶尔把一句拆成两条（实测 20 条回 23/25 条），二分永远不收敛；
-    # 带 [[n]] 标记就能把拆出来的片段按标记归位，一次请求拿全，不用反复二分。
+        return [{"role": "user", "content":
+                 f"把下面这句{src}翻译成{tgt}，只输出译文：\n" + batch[0] + note}]
     marked = "\n".join(f"[[{i + 1}]] {x}" for i, x in enumerate(batch))
     return [{"role": "user", "content":
              f"把下面每一行{src}翻译成{tgt}。必须原样保留每行开头的编号标记 [[n]]，"
-             "一个标记对应一条译文，不要合并或拆分编号，**最后一行也要单独给出它的编号**：\n" + marked}]
+             "一个标记对应一条译文，不要合并或拆分编号，**最后一行也要单独给出它的编号**：\n"
+             + marked + note}]
 
 
 def _ask_cloud(batch: list[str], key: str, chat_model: str, system: str,
@@ -1790,19 +1863,28 @@ def _ask_cloud(batch: list[str], key: str, chat_model: str, system: str,
         msg_file = fh.name
     try:
         raw = ""
+        direct = _needs_direct_http(chat_model)
+        service = "翻译（dashscope chat）" if direct else "翻译（bl text chat）"
         for attempt in range(1, TRANSLATE_ATTEMPTS + 1):
-            proc = subprocess.run(
-                _bl_argv(find_bl()) + ["text", "chat", "--model", chat_model,
-                                       "--messages-file", msg_file, "--api-key", key,
-                                       "--output", "json", "--quiet", "--timeout", str(timeout)],
-                capture_output=True, text=True, env=bl_env())
-            raw = proc.stdout
-            if proc.returncode == 0 and raw.strip():
+            if direct:
+                # qwen3 系：bl 发不了 enable_thinking 字段（服务端默认开思考，实测慢 10-60 倍）
+                raw, err = _http_chat(payload, key, chat_model, timeout)
+                ok = bool(raw.strip()) and not err
+            else:
+                proc = subprocess.run(
+                    _bl_argv(find_bl()) + ["text", "chat", "--model", chat_model,
+                                           "--messages-file", msg_file, "--api-key", key,
+                                           "--output", "json", "--quiet", "--timeout", str(timeout)],
+                    capture_output=True, text=True, env=bl_env())
+                raw = proc.stdout
+                err = "" if proc.returncode == 0 else (proc.stderr or raw)
+                ok = proc.returncode == 0 and raw.strip()
+            if ok:
                 break
-            detail = (proc.stderr or raw)[-200:].replace("\n", " ")
+            detail = (err or raw)[-200:].replace("\n", " ")
             # 配置类错误（key 无效/欠费/模型未开通）→ 立刻终止并给配置指引，不进重试与二分
             if diagnose_service(detail) and not diagnose_service(detail)[0].startswith("触发限流"):
-                fail_config("翻译（bl text chat）", detail)
+                fail_config(service, detail)
             print(f"[mt] 第 {attempt}/{TRANSLATE_ATTEMPTS} 次失败：{detail}", file=sys.stderr)
             if attempt < TRANSLATE_ATTEMPTS:
                 time.sleep(2 * attempt)          # 429 限流时退避
@@ -2624,7 +2706,8 @@ def main() -> None:
     ap.add_argument("--asr-model", default=ASR_MODEL_DEFAULT,
                     help=f"ASR 模型（默认 {ASR_MODEL_DEFAULT}）")
     ap.add_argument("--chat-model", default=CHAT_MODEL_DEFAULT,
-                    help=f"翻译模型（默认 {CHAT_MODEL_DEFAULT}，qwen-mt 系走编号标记协议）")
+                    help=f"翻译模型（默认 {CHAT_MODEL_DEFAULT}，直连 dashscope 并显式关思考；"
+                         "qwen-mt 系仍可用，走 bl 与原提示词；两类都走编号标记协议）")
     ap.add_argument("--api-key", default=None,
                     help="百炼 key（默认按 ~/.agentmemory/.env 的 OPENAI_API_KEY → DASHSCOPE_API_KEY 顺序找）")
     ap.add_argument("--asr-json", type=Path, default=None, help="复用已有 ASR 结果（跳过解音轨与转写）")

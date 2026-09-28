@@ -100,7 +100,11 @@ curl 逐张下载 `images[i].url_list[0]` 到 /tmp/dy_img_N.jpeg，用 read_imag
 | 2 | **同目录外挂字幕** | `<视频基名>.srt` / `.ass` / `.vtt` 直接读 |
 | 3 | **ASR 转写** | `ffmpeg -vn -ac 1 -ar 16000 -c:a libmp3lame -b:a 32k` 抽音轨（**有损 32k**，非无损） → `bl speech recognize` 异步 filetrans（句级 `begin_time/end_time` ＋ 词级 `words[]`）→ 按字幕规范切 cue |
 
-拿到原文后翻译：**默认云端 `qwen-mt-flash`**（`bl text chat`），可 `--backend local` 切本地 llama.cpp / mlx-lm 的 OpenAI 兼容服务。
+拿到原文后翻译：**默认云端 `qwen3.7-flash`**（直连 dashscope HTTP + 显式 `enable_thinking:false`，
+走 API 按量流量；换它的根因与实测见 ASR-API.md「纯文本翻译」——qwen-mt 对透明型习语只会直译且不可修）；
+`--chat-model qwen-mt-flash` 可切回 MT 专用模型（走 `bl text chat`），`--backend local` 切本地
+llama.cpp / mlx-lm 的 OpenAI 兼容服务。两类云端模型都走编号标记协议，非 qwen-mt 模型的提示词
+额外带风格指令（习语意译、禁止逐字直译）。
 
 ### 语言对与行序（这条分支的核心契约）
 
@@ -148,7 +152,7 @@ curl 逐张下载 `images[i].url_list[0]` 到 /tmp/dy_img_N.jpeg，用 read_imag
 ~/.dsh/skills/omnisub/omnisub "<视频>" \
   --out <输出目录> [--source auto|embedded|sidecar|asr] \
   [--source-lang auto|en|zh|ja|ko|fr|…] [--subtitles en,zh] \
-  [--sub-index N] [--chat-model qwen-mt-flash] [--backend cloud|local] \
+  [--sub-index N] [--chat-model qwen3.7-flash] [--backend cloud|local] \
   [--local-server http://127.0.0.1:8080] [--batch 20] [--workers 4] [--asr-json <已有.json>] \
   [--asr-chunk 0|1|4|N] [--asr-workers 4] \
   [--refresh-source] [--verify-sync auto|on|off] [--limit N] [--audio-lossless] [--no-probe] [--no-log] \
@@ -518,18 +522,30 @@ token-plan 那把都是 `401 Failed to get upload policy`——它们够不到 D
 - 用户**点名**要装进某个播放器时，才按那个播放器的文档装（路径随时会变，不要写死在技能里）。
 - 用户点名要 SRT（例如媒体库只吃 SRT）时，**如实告知 SRT 会丢掉全部样式**（字号/配色/加粗/描边），再按其选择交付。
 
-### 翻译后端选型（2026-09-27 实测，Apple M4/32GB，20 条真实字幕）
+### 翻译后端选型（2026-09-27 实测，Apple M4/32GB，20 条真实字幕；2026-09-28 默认换 qwen3.7-flash）
 
 | 后端 | 模型 | 20 条耗时 | decode | 内存 | 一集(765条) | 质量（中立裁判，位置互换） |
 |---|---|---|---|---|---|---|
-| **云端（默认）** | `qwen-mt-flash` | **1.8 s** | — | — | **≈70 s / ≈0.03 元** | 略优：更口语化、会本地化人名 |
-| 本地 | Hy-MT2-7B GGUF Q4_K_M（llama.cpp） | 13.2 s | 19.95 tok/s | 4.06 GB | ≈5.7–8.4 分 | 与云端基本持平（6:6、6:7），术语更准（`(RETCHES)`→「干呕声」） |
+| **云端（默认）** | `qwen3.7-flash`（直连 HTTP 关思考） | — | — | — | **68.3 s / 862 条实测（2026-09-28）≈0.01 元** | 习语意译（「麻烦事一桩接一桩」），qwen-mt 做不到 |
+| 云端（可选） | `qwen-mt-flash`（bl） | **1.8 s** | — | — | ≈70 s / ≈0.03 元 | 更快，但透明型习语字面直译且不可修（风格指令/原生 domains/升 plus 全部无效，实测） |
+| 本地 | Hy-MT2-7B GGUF Q4_K_M（llama.cpp） | 13.2 s | 19.95 tok/s | 4.06 GB | ≈5.7–8.4 分 | 与旧云端基本持平（6:6、6:7），术语更准（`(RETCHES)`→「干呕声」） |
 | 本地 | Hy-MT2-7B MLX 8bit | 22.5 s | 12.0 tok/s | 8.26 GB | ≈14 分 | 大致同级（结论受 20 条小样本/裁判差异影响） |
 
-**结论：生产用云端 `qwen-mt-flash`；离线/隐私场景用本地 llama.cpp Q4**（本地服务起法：`llama-server -m <gguf> --port 8080 -ngl 99`，再 `--backend local`）。
+**结论：生产用云端 `qwen3.7-flash`；离线/隐私场景用本地 llama.cpp Q4**（本地服务起法：`llama-server -m <gguf> --port 8080 -ngl 99`，再 `--backend local`）。
+qwen3-max **本项目禁用**（用户 2026-09-28 明令）；qwen3.7-flash 不在 token-plan（404），走 dashscope 按量流量。
 
 ### 这条分支的坑（实测）
 
+- **默认翻译模型 qwen3.7-flash 的两处硬约束（2026-09-28）**：① Qwen3 系**服务端默认开思考**，实测同一句翻译
+  不发 `enable_thinking` 字段 = 39.4 s/2353 tokens、显式 False = 0.6 s/10 tokens（66×）；而 `bl text chat`
+  只有 `--enable-thinking`（开启用）、请求体不带该字段（`--dry-run` 实证）→ qwen3 系**必须直连 dashscope
+  compatible-mode HTTP**（`_http_chat`），请求体断言已钉进 `selftest-langs.py`。② qwen3.7-flash **不在
+  token-plan**（404 Model not exist 实测），走 dashscope 按量流量（`~/.agentmemory/.env` 那把 key）。
+  qwen3-max 本项目禁用（用户 2026-09-28 明令）。
+- **改了源码别忘了 `--install`：闸门场景 12 装的是临时目录，真实安装树要手动同步**（2026-09-28 实测踩过）：
+  `selftest-omnisub.sh` 场景 12 只验证"安装机制能把源树完整装到 `--dest`"，**不会更新 `~/.dsh/skills/omnisub`**；
+  改完代码若直接用启动器跑端到端，跑的还是旧版（横幅 rev 与源不一致就是证据——源 `60a73825` ≠ 安装 `1f13bf81`）。
+  正确顺序：源码改完 → 过闸门 → `python3 scripts/omnisub.py --install` → **核对横幅 rev 与源一致** → 再跑端到端。
 - **翻译方向曾被写死在提示词里（本项目最严重的一次缺陷，2026-09-27）**：`_cloud_payload()` 对 `qwen-mt-*` 直接拼死字符串「把下面每一行**英文**翻译成**简体中文**」，`--target-lang` 根本没进请求。后果：中文源配"要英文"的产出是**中文原样重复两遍的假双语**——退出码 0、日志正常、耗时正常，端到端完全看不出来，只有直接查请求体才发现。修法：方向由 `src_lang`/`tgt_lang` 参数决定，且**必须与语言对一致**；同时用 `selftest-langs.py` 把"en→zh 提示词逐字节一致 + zh→en 方向正确"钉成闸门。
 - **漏译判据不能假设目标语言是中文**：`repair_missing()` 旧版判"漏译"的条件是"译文里没有汉字"，在 zh→en 方向下**每条正确的英文译文都不含汉字** → 全片被判漏译，白跑两轮补译（数百次请求），而补译结果又因同一条汉字判据被丢弃。现改为跟着 `tgt_lang` 走（`looks_like_lang`），并加了"纯符号行不算可翻译行"的护栏（`♪♪♪` 不该触发补译）。
 - **`--no-translate` 的防覆盖守卫：现在只问一件事——目标路径上已经有东西了吗。** 旧版用 `looks_bilingual()`（汉字符占比 >30%）判断"已有双语成品"，于是语言对不含中文时（如 `--subtitles en,ja`）成品会被静默覆盖；再往前一版还会把**用户自己的纯中文 .ass** 也当成"我们的双语成品"。现在的规则最简单也最安全：`<基名>.ass` 已存在 → 单语输出一律改写 `<基名>.mono.ass`，**绝不覆盖**（实测：既有文件 md5 不变）。

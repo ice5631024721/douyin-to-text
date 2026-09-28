@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -107,6 +108,28 @@ def main() -> int:
     check("日文" in ja2zh[0]["content"] and "简体中文" in ja2zh[0]["content"],
           "任意语言对：ja→zh 提示词带上日文源与中文目标",
           f"ja→zh 提示词异常：{ja2zh[0]['content']!r}")
+
+    # 通用指令模型（默认 qwen3.7-flash）：编号标记协议 + 风格指令。
+    # 根因（2026-09-28）：qwen-mt 对"透明型习语"只会字面直译，且风格指令对它无效；
+    # 通用模型 + 风格指令才意译（实测「麻烦事一桩接一桩，没完没了」）。闸门钉住这条提示词形状。
+    q37 = m._cloud_payload(["a", "b"], "qwen3.7-flash", "s", "en", "zh")
+    check(q37[0].get("role") == "user" and "[[1]] a" in q37[0]["content"]
+          and "[[2]] b" in q37[0]["content"]
+          and "把下面每一行英文翻译成简体中文" in q37[0]["content"]
+          and "意译" in q37[0]["content"] and "禁止逐字直译" in q37[0]["content"],
+          "通用指令模型走编号标记协议且带风格指令（习语直译的根因修复）",
+          f"qwen3.7-flash 批量提示词异常：{q37[0]['content']!r}")
+    q37_one = m._cloud_payload(["Hello there."], "qwen3.7-flash", "s", "en", "zh")
+    check("把下面这句英文翻译成简体中文" in q37_one[0]["content"] and "意译" in q37_one[0]["content"],
+          "通用指令模型单行也带风格指令（二分到单行/补末行时习语照样意译）",
+          f"qwen3.7-flash 单行提示词异常：{q37_one[0]['content']!r}")
+    q37_zh2en = m._cloud_payload(["你好"], "qwen3.7-flash", "s", "zh", "en")
+    check("简体中文翻译成英文" in q37_zh2en[0]["content"] and "意译" in q37_zh2en[0]["content"],
+          "通用指令模型 zh→en：方向与风格指令同时进请求",
+          f"qwen3.7-flash zh→en 提示词异常：{q37_zh2en[0]['content']!r}")
+    check(m._needs_direct_http("qwen3.7-flash") and not m._needs_direct_http("qwen-mt-flash"),
+          "qwen3 系直连 HTTP（bl 发不了关思考字段），qwen-mt 系仍走 bl",
+          "直连 HTTP 的模型路由不对")
 
     sysmsg = m.system_for("zh", "en")
     check("简体中文" in sysmsg and "英文" in sysmsg,
@@ -514,7 +537,9 @@ def main() -> int:
                 return _Proc(replies[min(len(calls) - 1, len(replies) - 1)])
 
             m.subprocess.run = _run
-            got = m._ask_cloud(batch, "k", m.CHAT_MODEL_DEFAULT, "sys", 5, "en", "zh")
+            # bl 传输路径只属于 qwen-mt-*（默认模型 qwen3.7-flash 走下面的 HTTP 桩）；
+            # 这里显式钉住 qwen-mt，别用 CHAT_MODEL_DEFAULT——默认模型换成 qwen3 系会静默改道
+            got = m._ask_cloud(batch, "k", "qwen-mt-flash", "sys", 5, "en", "zh")
             if kind == "aligned":
                 check(got is not None and len(got) == 30 and got[-1] == "尾巴译文",
                       "只缺末行 + 长度自洽 → 仍走提速路径（单条补末行，不二分）",
@@ -532,6 +557,64 @@ def main() -> int:
                       "编号齐全的平移被收下")
     finally:
         m.subprocess.run, m.find_bl, m.bl_env = orig_run, orig_bl, orig_env
+
+    # HTTP 传输路径（默认模型 qwen3.7-flash）：stub urlopen，验证同一套对齐语义之外，
+    # 还要验证请求体里 **enable_thinking 必须是 False**——qwen3 服务端默认开思考，
+    # 实测同一句翻译 39.4s/2353 tokens vs 0.6s/10 tokens（2026-09-28），这个字段漏发等于退化 60 倍。
+    class _Resp:
+        def __init__(self, content: str) -> None:
+            self._c = content
+
+        def read(self) -> bytes:
+            return json.dumps({"choices": [{"message": {"content": self._c}}]}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    bodies: list[dict] = []
+    orig_urlopen = m.urllib.request.urlopen
+    try:
+        for kind, n in (("aligned", 29), ("shift", 29), ("merged", 29), ("shift", 30)):
+            bodies.clear()
+            replies = [_reply(kind, n), "尾巴译文"]
+
+            def _open(req, timeout=None, _replies=None):
+                bodies.append(json.loads(bytes(req.data).decode("utf-8")))
+                return _Resp(_replies[min(len(bodies) - 1, len(_replies) - 1)])
+
+            m.urllib.request.urlopen = lambda req, timeout=None, _replies=replies: \
+                _open(req, timeout, _replies)
+            got = m._ask_cloud(batch, "k", m.CHAT_MODEL_DEFAULT, "sys", 5, "en", "zh")
+            if kind == "aligned":
+                check(got is not None and len(got) == 30 and got[-1] == "尾巴译文",
+                      "HTTP 路径：只缺末行 + 长度自洽 → 单条补末行（语义与 bl 路径一致）",
+                      f"HTTP 提速路径被误伤：{None if got is None else len(got)}")
+            elif kind == "merged":
+                check(got is None and len(bodies) == 1,
+                      "HTTP 路径：中间合并 + 只缺末行 → 返回 None 去二分",
+                      f"HTTP 合并型平移被收下：got={None if got is None else len(got)}")
+            elif n == 29:
+                check(got is None and len(bodies) == 1,
+                      "HTTP 路径：只缺末行但内容已平移 → 返回 None 去二分",
+                      f"HTTP 平移被原样收下：got={None if got is None else len(got)}")
+            else:
+                check(got is None, "HTTP 路径：编号齐全但内容平移 → 返回 None",
+                      "HTTP 编号齐全的平移被收下")
+        check(bodies and all(b.get("enable_thinking") is False for b in bodies),
+              "HTTP 请求体显式 enable_thinking=False（漏发 = 服务端默认开思考，慢 10-60 倍）",
+              "请求体缺 enable_thinking=False（qwen3 会默认开思考）")
+        check(all(b.get("model") == m.CHAT_MODEL_DEFAULT for b in bodies),
+              "HTTP 请求体 model 与所选翻译模型一致", "请求体 model 不对")
+        first = (bodies[0].get("messages") or [{}])[0].get("content", "") if bodies else ""
+        check("[[1]]" in first and "意译" in first and "system" not in
+              [msg.get("role") for msg in bodies[0].get("messages", [])],
+              "HTTP 提示词：编号标记 + 风格指令在场、不依赖 system 角色",
+              f"HTTP 提示词形状不对：{first[:120]!r}")
+    finally:
+        m.urllib.request.urlopen = orig_urlopen
 
     print()
     print(f"结果：{PASS} 通过 / {FAIL} 失败")

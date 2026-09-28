@@ -86,11 +86,26 @@ bl text chat --model qwen-mt-flash --messages-file /tmp/msg.json \
 
 | 模型 | 输入 | 输出 | 30 条实测墙钟 | 上下文 | 限流（北京） | 备注 |
 |---|---|---|---|---|---|---|
-| **qwen-mt-flash**（默认） | 0.7 元/百万 token | 1.95 | **2.69 s** | 输入/输出各 8192，ctx 16384 | RPM 60 / **TPM 35,000** | 与 turbo 同价同档，在售 |
+| **qwen3.7-flash**（默认） | 0.2 元/百万 token | 0.4 | **7.5 s**（关思考） | — | 未压测（限速器仍按 50 RPM） | 通用指令模型；**必须直连 HTTP 显式 `enable_thinking:false`**（见下）；token-plan 无此模型（404 实测），走 dashscope 按量流量，key 仍是 `~/.agentmemory/.env` 那把 |
+| **qwen-mt-flash**（可选） | 0.7 元/百万 token | 1.95 | **2.69 s** | 输入/输出各 8192，ctx 16384 | RPM 60 / **TPM 35,000** | MT 专用模型；对"透明型习语"字面直译且风格指令无效（见下），`--chat-model qwen-mt-flash` 仍可用 |
 | qwen-mt-lite | 0.6 | 1.6 | 1 s | 同左 | 同 flash 量级 | 输出会套 ```json 围栏、说话人标签保留英文 |
 | qwen-mt-plus | 1.8 | 5.4 | **3.92 s** | **同 flash（无差别）** | RPM 60 / **TPM 25,000** | 官方定位"旗舰级"，flash 是"轻量级" |
 | qwen-mt-uni | 文本 65 / 文档 20 / 图片 32 / 音频 400 元/百万 | 同左 | — | — | — | 多模态统一翻译 |
 | ~~qwen-mt-turbo~~ | 0.7 | 1.95 | 1 s | — | — | **2026-10-10 下线** |
+
+**为什么默认换 qwen3.7-flash（2026-09-28 定版，用户确认；qwen3-max 本项目禁用）**：
+
+- **根因（用户报"翻译不地道"的实测归因）**：`if it's not one thing, it's another` 这类**透明型习语**，
+  qwen-mt-flash 译成「要不是一件事，就是另一件事」（同义反复的直译）；且三条补救路全部实测无效——
+  提示词加风格指令（输出与不加几乎一字不差）、原生 `translation_options.domains`（不改变直译）、
+  升 qwen-mt-plus（照样直译）。这是 MT 专用模型的形式对等偏好，**不是提示词能修的**。
+- **qwen3.7-flash + 风格指令**（习语按意译、禁止逐字直译）实测意译：「麻烦事一桩接一桩，没完没了」；
+  30 条整批 30/30 标记协议服从、7.5 s/批；全片 862 条实测翻译 68.3 s（≈0.01 元/集，比 qwen-mt-flash 还便宜）。
+- **代价与坑**：qwen3 系**服务端默认开思考**——实测同一句翻译，不发 `enable_thinking` 字段 = 39.4 s / 2353 输出
+  tokens（含 6877 字思考），显式 False = 0.6 s / 10 tokens（**66× 时延差**）。`bl text chat` 只有
+  `--enable-thinking`（开启用）、请求体根本不带该字段（`--dry-run` 实证）→ **qwen3 系必须直连
+  dashscope compatible-mode HTTP**（`_http_chat`，scripts/omnisub.py）。另一坑：qwen3.7-flash
+  **不在 token-plan**（404 Model not exist），不要拿 token-plan 的 key 调它。
 
 **plus vs flash 到底差在哪（2026-09-27 实测，30 条真实纪录片旁白，走生产 `translate()` 路径，qwen3-max 盲评 + 位置互换双评）**：
 
