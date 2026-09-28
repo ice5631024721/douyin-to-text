@@ -27,11 +27,16 @@ engine:
     transport: local
     conversation_mode: stateful
     response_format: session_result
-    timeout_seconds: 300
+    # 300s 会让"先读脚本 + 读 SKILL.md，再执行"的重用例跑不完：实测 video-source-artifact-guard
+    # 在 iteration-3/5 两次被 295s 切断（不是断言失败）。给足探索预算。
+    timeout_seconds: 600
     env:
       # ${api_key} 由 skill-up 凭据链解析（~/.skill-up/credentials.yaml），密钥不落 YAML
       DSH_API_KEY: ${api_key}
-      DSH_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
+      # **必须与凭据里的 key 同域**：~/.skill-up/credentials.yaml 的 key 是 token-plan 的
+      # （sk-sp-…），只在 token-plan.cn-beijing.maas.aliyuncs.com 有效；指向 dashscope.aliyuncs.com
+      # 会 6/6 全 401（实测 iteration-9）。留出外层覆盖口，换回 dashscope key 时设 DSH_BASE_URL 即可。
+      DSH_BASE_URL: ${DSH_BASE_URL:-https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1}
       DSH_MODEL: ${model_name}
       # 绝对路径：被测宿主 PATH 可能极简，按名找不到二进制
       DSH_BIN: ${SKILLUP_DSH_BIN:-/path/to/skill-up-dsh/dsh}
@@ -60,7 +65,7 @@ cases:
     - evals/cases/video-source-artifact-guard.yaml
     - evals/cases/video-bilingual-ass-contract.yaml
   defaults:
-    timeout_seconds: 300
+    timeout_seconds: 600
     max_turns: 8
   parallelism: 1
 

@@ -377,6 +377,162 @@ def main() -> int:
               "真外挂字幕即使台词里出现 omnisub 也被正常采纳（标记按整行匹配，不搜子串）",
               f"真外挂被误判成自家产物：{m.sidecar_path(video)}")
 
+    # ---- 7. 对齐闸门 + 长度平移判据（2026-09-27 真实交付缺陷的回归闸门）----
+    # 缺陷链（实测）：模型把相邻两句合并进同一个编号 [[k]] → 其后整体前移、末尾那条被挤掉 →
+    # 回复"只缺末行"但前 n-1 条**已全部错位**；旧版"只缺末行就单独补问"的优化据此原样收下，
+    # 污染整批（E04 实测 15 个单元），而成品里那段每句都以句号结尾 → 标点判据全绿、闸门漏过，
+    # 一路交付到用户手里，靠地面真值审计（tools/deep-align-check.py）才发现。
+    # 这一节锁两件事：① 长度自洽判据的正反例；② _ask_cloud 遇到平移必须返回 None（去二分）。
+    print("== 7a. ASR 分片数必须服从模型单次上限 ==")
+    # 实测：qwen-audio-3.1-asr-flash（同步版）单请求硬上限 300 秒，5 分钟切片直接报
+    # AUDIO_DURATION_TOO_LONG。而"自动 4 段"对 50 分钟的片是 750 秒/段 → 每段都会被拒。
+    n_sync = m.resolve_asr_chunks(0, 3000, "qwen-audio-3.1-asr-flash")
+    check(n_sync >= 11 and 3000 / n_sync <= 300,
+          f"同步模型（300 秒上限）：50 分钟片自动切到 {n_sync} 段（{3000 / n_sync:.0f} 秒/段）",
+          f"同步模型没按上限提段数：{n_sync} 段 → {3000 / n_sync:.0f} 秒/段（会被服务端拒）")
+    check(m.resolve_asr_chunks(0, 3480, "qwen-audio-3.1-asr-flash") >= 12,
+          "同步模型：58 分钟片也切得下", "58 分钟片没切够")
+    check(m.resolve_asr_chunks(0, 3000, "qwen-audio-3.1-asr-flash-filetrans") == m.ASR_CHUNK_AUTO,
+          "filetrans（异步、整集直送）：段数维持自动值不变", "filetrans 的段数被误改")
+    try:
+        m.resolve_asr_chunks(4, 3000, "qwen-audio-3.1-asr-flash")
+        raised = False
+    except SystemExit:
+        raised = True
+    check(raised, "显式给了超上限的段数 → 当场报错（不等到每个请求都被拒才失败）",
+          "超上限的段数被放过 → 会白烧请求")
+    check(m.resolve_asr_chunks(0, 120, "qwen-audio-3.1-asr-flash") == 1,
+          "短片（120 秒）不受上限影响，仍是 1 段", "短片被无谓切片")
+
+    print("== 7b. 服务端报错的诊断文案（要给对建议）==")
+    ft = m.diagnose_service('{"error": {"code": 1, "message": "Free quota exhausted.",'
+                            ' "http_status": 403, "api_code": "AllocationQuota.FreeTierOnly"}}')
+    # 断言表达**语义**而不是某个词：认出"免费额度用完即停"这个开关、处置指向控制台开关页，
+    # 且**不得**落到通用 403 那条错建议（"去开通/授权模型"）。2026-09-28 实测：文案从
+    # "充值不生效"改精确成"与余额无关"时，写死"充值"的旧断言变红——闸门抓的是改动，不是缺陷。
+    check(ft is not None and "免费额度用完即停" in ft[0] and "开关" in ft[1]
+          and "开通" not in ft[1] and "授权" not in ft[1],
+          "「免费额度用完即停」被单独识别，处置指向控制台开关（不是「去开通模型」那条错建议）",
+          f"FreeTierOnly 落到通用 403 规则、给了错建议：{ft}")
+    arrear = m.diagnose_service('{"error": {"code": 1, "message": "Arrearage", "http_status": 400}}')
+    check(arrear is not None and "欠费" in arrear[0], "欠费仍归到充值那条", f"欠费诊断异常：{arrear}")
+
+    print("== 7. 对齐闸门与长度平移判据（旧缺陷回归）==")
+    varied = [20 + (i * 13) % 80 for i in range(12)]
+    aligned = [int(x * 0.34) for x in varied]
+    shifted = [int(varied[min(i + 1, len(varied) - 1)] * 0.34) for i in range(len(varied))]
+    check(m.length_shift_suspected(varied, aligned) is False,
+          "长度判据：长度参差但对齐 → 不误报", "长度判据把对齐批误判为平移")
+    check(m.length_shift_suspected(varied, shifted) is True,
+          "长度判据：整体平移一条 → 抓到（旧版漏过的那一类）", "长度判据漏掉整体平移")
+    check(m.length_shift_suspected(varied[:4], aligned[:4]) is False,
+          "长度判据：样本过少不判（防噪声）", "样本过少也判平移")
+    # 闸门层：30 个单元被整体平移 → shift_windows>0 且判失败；对齐 → 全 0 且通过
+    def _gate(shift: bool, ratio: float = 0.34, spread: float = 0.0,
+              src_lang: str = "en") -> dict:
+        """ratio = 译文长/源文长 的中位量级；spread = 该比值的相对抖动（模拟不同语言对的噪声）。"""
+        n = 60
+        cues = [{"begin": i * 1000, "end": i * 1000 + 900,
+                 "text": ("word " * (4 + (i * 5) % 20)).strip() + "."} for i in range(n)]
+        spans = [(i, i + 1) for i in range(n)]
+        unit_lines = [c["text"] for c in cues]
+        # 现实形状：**局部**平移（8/60 ≈ 13%，模拟"某个批次被污染"），不是整片中招。
+        # 实测（60 单元夹具，三对语言量级一致）：污染 6–20 个（10%–33%）都能抓到，
+        # 4 个太少（低于"连续 ≥4 个窗口"的机制下限），30 个（50%）抓不到——基数由局部 MAD
+        # 的中位数自校准，污染占多数时会把自己抬高，那种"整片都平移"只能靠地面真值审计
+        # （tools/deep-align-check.py）判定。
+        arr = []
+        for i in range(n):
+            t = unit_lines[i + 1] if (shift and 10 <= i < 18 and i + 1 < n) else unit_lines[i]
+            wobble = 1 + spread * (((i * 37) % 11 - 5) / 5.0)
+            arr.append("译" * max(1, int(ratio * len(t) * wobble)) + "。")
+        return m.sync_faults(cues, spans, {"tgt": arr}, unit_lines, src_lang)
+
+    clean_info = _gate(False)
+    check(clean_info["ok"] is True and clean_info["shift_windows"] == 0,
+          "闸门：对齐数据判通过、长度平移窗口 0（不误报）",
+          f"对齐数据被判失败：ok={clean_info['ok']} windows={clean_info['shift_windows']}")
+    shift_info = _gate(True)
+    check(shift_info["shift_windows"] > 0 and shift_info["ok"] is False,
+          "闸门：成段平移被长度扫描抓到并判失败（标点信号对此失明）",
+          f"成段平移漏过：windows={shift_info['shift_windows']} ok={shift_info['ok']}")
+
+    # **跨语言对不能过拟合**（2026-09-28 实测三对真实缓存）：en→zh 比值中位 0.34/MAD 0.038、
+    # en→ja 0.49/0.068、zh→en 3.86/0.616 —— 比值量级差 11 倍、离散度差 16 倍，判据必须全都成立。
+    # 注意：批级判据 `length_shift_suspected` 只管"整批平移"，**半条段平移由这里的滚动扫描负责**，
+    # 所以跨语言用例走 `_gate`（真实闸门路径），不要拿批级判据去测局部平移（实测会误报成"漏过"）。
+    zhen_clean = _gate(False, ratio=3.86, spread=0.16, src_lang="zh")
+    check(zhen_clean["ok"] is True and zhen_clean["shift_windows"] == 0,
+          "闸门：zh→en 量级（比值 ≈3.9、离散度 16×）对齐时不误报",
+          f"zh→en 量级被误判：windows={zhen_clean['shift_windows']}")
+    zhen_shift = _gate(True, ratio=3.86, spread=0.16, src_lang="zh")
+    check(zhen_shift["shift_windows"] > 0 and zhen_shift["ok"] is False,
+          "闸门：zh→en 量级的局部平移被抓到（离散度大反而更灵）",
+          f"zh→en 量级平移漏过：windows={zhen_shift['shift_windows']}")
+    enzh_clean2 = _gate(False, ratio=0.34, spread=0.11, src_lang="en")
+    check(enzh_clean2["shift_windows"] == 0,
+          "闸门：en→zh 量级带真实抖动（MAD/中位 ≈0.11）对齐时不误报", "en→zh 量级被误判")
+    ja_clean = _gate(False, ratio=0.49, spread=0.14, src_lang="en")
+    check(ja_clean["ok"] is True and ja_clean["shift_windows"] == 0,
+          "闸门：en→ja 量级（比值 ≈0.5）对齐时不误报", "en→ja 量级被误判")
+
+    # _ask_cloud 层：把 bl 子进程换成桩，验证平移时必须返回 None（走二分），且不得收下错位内容
+    batch = [("word " * (4 + (i * 3) % 20)).strip() for i in range(30)]
+
+    def _reply(kind: str, n: int) -> str:
+        """kind=aligned 各自对位；shift 整体前移；merged 复刻真实缺陷（第 6 条吸收第 7 条后整体前移）。"""
+        out = []
+        for i in range(n):
+            if kind == "shift":
+                t = batch[i + 1] if i + 1 < len(batch) else batch[i]
+            elif kind == "merged":
+                # 真实形状：第 6 个编号**吸收**第 7 条（两句并进一个编号），其后整体前移一条，
+                # 末尾被挤掉 → 于是"缺的只有最后一行"，但前面已经错位。
+                t = batch[i] if i < 5 else (batch[6] if i == 5 else batch[i + 1])
+            else:
+                t = batch[i]
+            seg = "译" * int(0.34 * len(t))
+            if kind == "merged" and i == 5:
+                seg += "译" * int(0.34 * len(batch[6]))     # 吸收进来的那一条
+            out.append(f"[[{i + 1}]] " + seg)
+        return "\n".join(out)
+
+    class _Proc:
+        def __init__(self, out: str) -> None:
+            self.stdout, self.stderr, self.returncode = out, "", 0
+
+    calls: list[list[str]] = []
+    orig_run, orig_bl, orig_env = m.subprocess.run, m.find_bl, m.bl_env
+    try:
+        m.find_bl, m.bl_env = (lambda: "bl"), (lambda: {})
+        for kind, n in (("aligned", 29), ("shift", 29), ("merged", 29), ("shift", 30)):
+            calls.clear()
+            replies = [_reply(kind, n), "尾巴译文"]
+
+            def _run(cmd, **kw):
+                calls.append(cmd)
+                return _Proc(replies[min(len(calls) - 1, len(replies) - 1)])
+
+            m.subprocess.run = _run
+            got = m._ask_cloud(batch, "k", m.CHAT_MODEL_DEFAULT, "sys", 5, "en", "zh")
+            if kind == "aligned":
+                check(got is not None and len(got) == 30 and got[-1] == "尾巴译文",
+                      "只缺末行 + 长度自洽 → 仍走提速路径（单条补末行，不二分）",
+                      f"正常提速路径被误伤：{None if got is None else len(got)}")
+            elif kind == "merged":
+                check(got is None and len(calls) == 1,
+                      "中间合并 + 只缺末行 → 返回 None 去二分（真实缺陷形状）",
+                      f"合并型平移被收下：got={None if got is None else len(got)} calls={len(calls)}")
+            elif n == 29:
+                check(got is None and len(calls) == 1,
+                      "只缺末行但内容已平移 → 返回 None 去二分（**本轮缺陷的闸门**）",
+                      f"平移被原样收下（缺陷复现）：got={None if got is None else len(got)} calls={len(calls)}")
+            else:
+                check(got is None, "编号齐全但内容平移 → 也返回 None（编号齐全 ≠ 对位）",
+                      "编号齐全的平移被收下")
+    finally:
+        m.subprocess.run, m.find_bl, m.bl_env = orig_run, orig_bl, orig_env
+
     print()
     print(f"结果：{PASS} 通过 / {FAIL} 失败")
     return 1 if FAIL else 0
